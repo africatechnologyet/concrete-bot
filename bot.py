@@ -289,7 +289,7 @@ async def handle_approval(update: Update, context: CallbackContext):
         pi['status'] = 'approved'
         save_data(bot_data)
         pdf = generate_pdf(pi)
-        await context.bot.send_document(pi['user_id'], document=pdf, filename=f"{q_num}.pdf", caption="Approved!")
+        await context.bot.send_document(pi['user_id'], document=pdf, company_safe = "".join(x for x in pi.get("customer", "Quote") if x.isalnum() or x in " ").replace(" ", "_"); filename=f"{company_safe}_{q_num}.pdf", caption="Approved!")
         await query.edit_message_text(f"Quote {q_num} Approved & Sent.")
 
 async def cancel(update: Update, context: CallbackContext):
@@ -325,4 +325,6 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
 
