@@ -300,7 +300,7 @@ async def handle_start_over(update: Update, context: CallbackContext):
     return await create_pi(update, context)
 
 def main():
-    app = Application.builder().token(os.environ.get("PI_BOT_TOKEN")).build()
+    app = Application.builder().token("8513160001:AAELK8YtZxL34U2tWrNsXLOGooJEVSWqKWI").build()
     
     conv = ConversationHandler(
         entry_points=[CommandHandler('createpi', create_pi), CallbackQueryHandler(handle_start_over, pattern='^start_over$')],
