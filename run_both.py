@@ -6,11 +6,11 @@ from concrete_logistics_bot import main as main1
 from bot import main as main2
 
 def run_bot1():
-    # Runs the Logistics Bot
+    # We pass stop_signals=None because this is running in a thread
     asyncio.run(main1())
 
 def run_bot2():
-    # Runs the PI Bot
+    # We pass stop_signals=None because this is running in a thread
     asyncio.run(main2())
 
 if __name__ == "__main__":

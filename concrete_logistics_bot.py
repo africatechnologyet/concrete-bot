@@ -973,7 +973,7 @@ def main():
     else:
         # Fallback to polling for local dev
         log.warning("Starting polling (local mode)…")
-        app.run_polling(poll_interval=1.0, timeout=30, drop_pending_updates=True)
+        app.run_polling(poll_interval=1.0, timeout=30, drop_pending_updates=True, stop_signals=None)
 
 if __name__=="__main__":
     main()

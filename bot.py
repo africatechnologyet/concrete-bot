@@ -321,7 +321,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_approval, pattern='^approve_'))
     
     print("Bot is running...")
-    app.run_polling()
+    app.run_polling(stop_signals=None)
 
 if __name__ == '__main__':
     main()
