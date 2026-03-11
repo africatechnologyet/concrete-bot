@@ -1,6 +1,6 @@
 import asyncio
 from bot import main as start_pi_bot
-from logistics_bot import main as start_logistics_bot
+from concrete_logistics_bot import main as start_logistics_bot
 
 async def run():
     # This runs both bots at the same time without crashing
@@ -8,3 +8,4 @@ async def run():
 
 if __name__ == '__main__':
     asyncio.run(run())
+
