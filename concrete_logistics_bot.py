@@ -7,7 +7,6 @@ Worker link: https://t.me/MaterialConcretebot?start=Worker
 import sqlite3
 import logging
 import io
-import asyncio
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timedelta, date
@@ -29,38 +28,39 @@ BOT_USERNAME  = "MaterialConcretebot"
 ADMIN_SECRET  = "Admin"
 WORKER_SECRET = "Worker"
 DB_PATH       = "logistics.db"
-PORT          = 10000   # Render requires port 10000
+PORT          = 10000
 
-logging.basicConfig(
-    format="%(asctime)s %(levelname)s %(message)s",
-    level=logging.WARNING,
-)
+CONCRETE_TYPES = [
+    "C5","C8","C10","C12","C15","C16","C20",
+    "C25","C30","C35","C40","C45","C50"
+]
+
+logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # Conversation states
-(ASK_JOB, ASK_PLATE, ASK_PLATE_MANUAL, ASK_VOLUME, CONFIRM_TRIP) = range(5)
+(ASK_JOB, ASK_CONCRETE, ASK_PLATE, ASK_PLATE_MANUAL,
+ ASK_VOLUME, CONFIRM_TRIP) = range(6)
 ASK_NEW_JOB_NAME = 10
 ASK_NEW_TRUCK    = 20
 
 
 # ─────────────────────────────────────────────
-# KEEP-ALIVE HTTP SERVER  (required for Render free)
+# HEALTH SERVER
 # ─────────────────────────────────────────────
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"Bot is running!")
-    def log_message(self, *args):
-        pass  # silence HTTP logs
+    def log_message(self, *args): pass
 
 def run_health_server():
-    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
-    server.serve_forever()
+    HTTPServer(("0.0.0.0", PORT), HealthHandler).serve_forever()
 
 
 # ─────────────────────────────────────────────
-# PERSISTENT DB CONNECTION
+# PERSISTENT DB
 # ─────────────────────────────────────────────
 _db: Optional[sqlite3.Connection] = None
 
@@ -84,6 +84,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS trips (
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
             timestamp TEXT NOT NULL, job_name TEXT NOT NULL,
+            concrete_type TEXT NOT NULL DEFAULT '',
             truck_plate TEXT NOT NULL, volume REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS jobs (
             id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
@@ -96,6 +97,12 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_trips_job       ON trips(job_name);
         CREATE INDEX IF NOT EXISTS idx_jobs_status     ON jobs(status);
     """)
+    # Add concrete_type column if upgrading from old DB
+    try:
+        get_db().execute("ALTER TABLE trips ADD COLUMN concrete_type TEXT NOT NULL DEFAULT ''")
+        get_db().commit()
+    except Exception:
+        pass
     get_db().commit()
 
 
@@ -103,7 +110,6 @@ def init_db():
 # CACHE
 # ─────────────────────────────────────────────
 _cache: dict = {}
-
 def cache_get(key): return _cache.get(key)
 def cache_set(key, value): _cache[key] = value
 def cache_clear(*keys):
@@ -199,10 +205,10 @@ def update_job_status(job_id: int, status: str):
     cache_clear("jobs_active", "jobs_None")
 
 
-def save_trip(user_id: int, job_name: str, truck_plate: str, volume: float):
+def save_trip(user_id: int, job_name: str, concrete_type: str, truck_plate: str, volume: float):
     get_db().execute(
-        "INSERT INTO trips (user_id, timestamp, job_name, truck_plate, volume) VALUES (?,?,?,?,?)",
-        (user_id, now_str(), job_name, truck_plate, volume))
+        "INSERT INTO trips (user_id, timestamp, job_name, concrete_type, truck_plate, volume) VALUES (?,?,?,?,?,?)",
+        (user_id, now_str(), job_name, concrete_type, truck_plate, volume))
     get_db().commit()
     for k in list(_cache.keys()):
         if k.startswith("trips_") or k.startswith("summary_"):
@@ -277,32 +283,47 @@ def generate_text_report(period: str) -> str:
     if not trips:
         return f"📋 *{label}*\n\n_No trips recorded for this period._"
 
-    job_totals:   dict = {}
-    truck_totals: dict = {}
+    job_totals:      dict = {}
+    truck_totals:    dict = {}
+    concrete_totals: dict = {}
+
     for t in trips:
-        j, p, v = t["job_name"], t["truck_plate"], t["volume"]
-        if j not in job_totals:   job_totals[j]   = [0.0, 0]
-        if p not in truck_totals: truck_totals[p] = [0.0, 0]
-        job_totals[j][0]   += v; job_totals[j][1]   += 1
-        truck_totals[p][0] += v; truck_totals[p][1] += 1
+        j  = t["job_name"]
+        p  = t["truck_plate"]
+        c  = t.get("concrete_type") or "N/A"
+        v  = t["volume"]
+        if j not in job_totals:      job_totals[j]      = [0.0, 0]
+        if p not in truck_totals:    truck_totals[p]    = [0.0, 0]
+        if c not in concrete_totals: concrete_totals[c] = [0.0, 0]
+        job_totals[j][0]      += v; job_totals[j][1]      += 1
+        truck_totals[p][0]    += v; truck_totals[p][1]    += 1
+        concrete_totals[c][0] += v; concrete_totals[c][1] += 1
 
-    sorted_jobs   = sorted(job_totals.items(),   key=lambda x: x[1][0], reverse=True)[:5]
-    sorted_trucks = sorted(truck_totals.items(), key=lambda x: x[1][0], reverse=True)
-    total_vol     = sum(v[0] for _, v in job_totals.items())
-    total_trips   = sum(v[1] for _, v in job_totals.items())
-    medals        = ["🥇", "🥈", "🥉"]
+    sorted_jobs     = sorted(job_totals.items(),      key=lambda x: x[1][0], reverse=True)[:5]
+    sorted_trucks   = sorted(truck_totals.items(),    key=lambda x: x[1][0], reverse=True)
+    sorted_concrete = sorted(concrete_totals.items(), key=lambda x: x[1][0], reverse=True)
+    total_vol       = sum(v[0] for _, v in job_totals.items())
+    total_trips     = sum(v[1] for _, v in job_totals.items())
+    medals          = ["🥇", "🥈", "🥉"]
 
-    job_lines   = "\n".join(f"  {i+1}. {n}: *{d[0]:.1f} m³* ({d[1]} trips)"
-                            for i, (n, d) in enumerate(sorted_jobs))
-    truck_lines = "\n".join(f"  {medals[i] if i<3 else '▪️'} {pl}: *{d[0]:.1f} m³* ({d[1]} trips)"
-                            for i, (pl, d) in enumerate(sorted_trucks))
+    job_lines = "\n".join(
+        f"  {i+1}. {n}: *{d[0]:.1f} m³* ({d[1]} trips)"
+        for i, (n, d) in enumerate(sorted_jobs))
+    truck_lines = "\n".join(
+        f"  {medals[i] if i<3 else '▪️'} {pl}: *{d[0]:.1f} m³* ({d[1]} trips)"
+        for i, (pl, d) in enumerate(sorted_trucks))
+    concrete_lines = "\n".join(
+        f"  🧱 {c}: *{d[0]:.1f} m³* ({d[1]} trips)"
+        for c, d in sorted_concrete)
 
-    return (f"📋 *{label}*\n━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📅 *Job Summary*\n{job_lines}\n"
-            f"  ─────────\n  Total: *{total_vol:.1f} m³* | *{total_trips} trips*\n\n"
-            f"🚛 *Truck Rankings*\n{truck_lines}\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"_Generated {datetime.now().strftime('%H:%M %d %b %Y')}_")
+    return (
+        f"📋 *{label}*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📅 *Job Summary*\n{job_lines}\n"
+        f"  ─────────\n  Total: *{total_vol:.1f} m³* | *{total_trips} trips*\n\n"
+        f"🧱 *Concrete Types*\n{concrete_lines}\n\n"
+        f"🚛 *Truck Rankings*\n{truck_lines}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"_Generated {datetime.now().strftime('%H:%M %d %b %Y')}_")
 
 
 def generate_excel_report(period: str) -> io.BytesIO:
@@ -312,7 +333,8 @@ def generate_excel_report(period: str) -> io.BytesIO:
     ws.title = "Raw Trips"
     hfill = PatternFill("solid", fgColor="1F4E79")
     hfont = Font(bold=True, color="FFFFFF")
-    for col, h in enumerate(["#", "Timestamp", "Job Site", "Truck Plate", "Volume (m³)"], 1):
+    headers = ["#", "Timestamp", "Job Site", "Concrete Type", "Truck Plate", "Volume (m³)"]
+    for col, h in enumerate(headers, 1):
         c = ws.cell(row=1, column=col, value=h)
         c.font = hfont; c.fill = hfill
         c.alignment = Alignment(horizontal="center")
@@ -320,11 +342,13 @@ def generate_excel_report(period: str) -> io.BytesIO:
         ws.cell(row=i, column=1, value=i-1)
         ws.cell(row=i, column=2, value=t["timestamp"])
         ws.cell(row=i, column=3, value=t["job_name"])
-        ws.cell(row=i, column=4, value=t["truck_plate"])
-        ws.cell(row=i, column=5, value=t["volume"])
+        ws.cell(row=i, column=4, value=t.get("concrete_type") or "N/A")
+        ws.cell(row=i, column=5, value=t["truck_plate"])
+        ws.cell(row=i, column=6, value=t["volume"])
     for col in ws.columns:
         ws.column_dimensions[col[0].column_letter].width = 20
 
+    # Job summary
     ws2 = wb.create_sheet("Job Summary")
     ws2.append(["Job Site", "Total Volume (m³)", "Total Trips"])
     for c in ws2[1]: c.font = Font(bold=True)
@@ -336,9 +360,22 @@ def generate_excel_report(period: str) -> io.BytesIO:
     for n, (v, tr) in sorted(jt.items(), key=lambda x: x[1][0], reverse=True):
         ws2.append([n, round(v, 2), tr])
 
-    ws3 = wb.create_sheet("Truck Rankings")
-    ws3.append(["Rank", "Truck Plate", "Total Volume (m³)", "Total Trips"])
+    # Concrete type summary
+    ws3 = wb.create_sheet("Concrete Types")
+    ws3.append(["Concrete Type", "Total Volume (m³)", "Total Trips"])
     for c in ws3[1]: c.font = Font(bold=True)
+    ct: dict = {}
+    for t in trips:
+        c = t.get("concrete_type") or "N/A"
+        if c not in ct: ct[c] = [0.0, 0]
+        ct[c][0] += t["volume"]; ct[c][1] += 1
+    for c, (v, tr) in sorted(ct.items(), key=lambda x: x[1][0], reverse=True):
+        ws3.append([c, round(v, 2), tr])
+
+    # Truck summary
+    ws4 = wb.create_sheet("Truck Rankings")
+    ws4.append(["Rank", "Truck Plate", "Total Volume (m³)", "Total Trips"])
+    for c in ws4[1]: c.font = Font(bold=True)
     tt: dict = {}
     for t in trips:
         p = t["truck_plate"]
@@ -346,7 +383,7 @@ def generate_excel_report(period: str) -> io.BytesIO:
         tt[p][0] += t["volume"]; tt[p][1] += 1
     for rank, (pl, (v, tr)) in enumerate(
             sorted(tt.items(), key=lambda x: x[1][0], reverse=True), 1):
-        ws3.append([rank, pl, round(v, 2), tr])
+        ws4.append([rank, pl, round(v, 2), tr])
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -359,6 +396,7 @@ def generate_excel_report(period: str) -> io.BytesIO:
 # ─────────────────────────────────────────────
 def back_kb():
     return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="back_main")]])
+
 
 def build_main_menu(user_id: int) -> InlineKeyboardMarkup:
     admin = is_admin(user_id)
@@ -376,6 +414,7 @@ def build_main_menu(user_id: int) -> InlineKeyboardMarkup:
         kb.append([InlineKeyboardButton("❌ Cancel Job",      callback_data="cancel_job")])
     return InlineKeyboardMarkup(kb)
 
+
 def trucks_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Add Truck",    callback_data="add_truck")],
@@ -383,11 +422,27 @@ def trucks_keyboard():
         [InlineKeyboardButton("⬅️ Back",         callback_data="back_main")],
     ])
 
+
+def concrete_keyboard() -> InlineKeyboardMarkup:
+    # 3 buttons per row
+    rows = []
+    row  = []
+    for i, c in enumerate(CONCRETE_TYPES, 1):
+        row.append(InlineKeyboardButton(c, callback_data=f"concrete_{c}"))
+        if i % 3 == 0:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return InlineKeyboardMarkup(rows)
+
+
 def confirm_plate_kb():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Yes, correct",     callback_data="plate_confirm_yes")],
         [InlineKeyboardButton("🔄 Choose different", callback_data="plate_confirm_no")],
     ])
+
 
 def trip_done_kb():
     return InlineKeyboardMarkup([
@@ -419,8 +474,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"👷 *Welcome, {user.first_name}!*\n\nYou have worker access.",
                 parse_mode="Markdown", reply_markup=build_main_menu(user_id))
         else:
-            await update.message.reply_text(
-                "❌ *Invalid access link.*", parse_mode="Markdown")
+            await update.message.reply_text("❌ *Invalid access link.*", parse_mode="Markdown")
         return
     role = get_user_role(user_id)
     if role:
@@ -430,8 +484,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown", reply_markup=build_main_menu(user_id))
     else:
         await update.message.reply_text(
-            "🚫 *Access Required*\n\nUse the link from your admin.",
-            parse_mode="Markdown")
+            "🚫 *Access Required*\n\nUse the link from your admin.", parse_mode="Markdown")
 
 
 async def back_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -446,6 +499,7 @@ async def back_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(
         f"🏗️ *Concrete Logistics Bot*\n_{label}_\n\nWhat would you like to do?",
         parse_mode="Markdown", reply_markup=build_main_menu(user_id))
+
 
 async def noop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
@@ -627,8 +681,7 @@ async def do_cancel_job(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if job:
         update_job_status(job_id, "cancelled")
         await query.edit_message_text(
-            f"❌ *Cancelled*\n\n🏗️ *{job['name']}*",
-            parse_mode="Markdown",
+            f"❌ *Cancelled*\n\n🏗️ *{job['name']}*", parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="back_main")]]))
 
 
@@ -676,8 +729,7 @@ async def delete_reports_execute(update: Update, context: ContextTypes.DEFAULT_T
     await query.answer()
     count  = delete_trips_by_period(period)
     await query.edit_message_text(
-        f"🗑️ *Done!* `{count}` records deleted.",
-        parse_mode="Markdown",
+        f"🗑️ *Done!* `{count}` records deleted.", parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🗑️ Delete More", callback_data="delete_reports_menu")],
             [InlineKeyboardButton("🏠 Main Menu",   callback_data="back_main")],
@@ -732,6 +784,7 @@ async def send_excel_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─────────────────────────────────────────────
 # LOG TRIP CONVERSATION
+# Flow: Job → Concrete Type → Truck → Confirm → Volume
 # ─────────────────────────────────────────────
 async def log_trip_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query   = update.callback_query
@@ -746,7 +799,7 @@ async def log_trip_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             parse_mode="Markdown", reply_markup=back_kb())
         return ConversationHandler.END
     kb = [[InlineKeyboardButton(f"🏗️ {j['name']}", callback_data=f"tripjob_{j['id']}")] for j in jobs]
-    await query.message.reply_text("📍 *Select Job Site:*",
+    await query.message.reply_text("📍 *Step 1 of 4 — Select Job Site:*",
         parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
     return ASK_JOB
 
@@ -757,10 +810,23 @@ async def job_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     await query.answer()
     job = get_job_by_id(job_id)
     context.user_data["job_name"] = job["name"]
+    await query.message.reply_text(
+        f"🧱 *Step 2 of 4 — Select Concrete Type:*\nJob: `{job['name']}`",
+        parse_mode="Markdown", reply_markup=concrete_keyboard())
+    return ASK_CONCRETE
+
+
+async def concrete_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query         = update.callback_query
+    concrete_type = query.data.replace("concrete_", "")
+    await query.answer()
+    context.user_data["concrete_type"] = concrete_type
     trucks = get_all_trucks()
     kb = [[InlineKeyboardButton(f"🚛 {t['plate']}", callback_data=f"truckpick_{t['plate']}")] for t in trucks]
     kb.append([InlineKeyboardButton("✏️ Enter manually", callback_data="truckpick_manual")])
-    await query.message.reply_text(f"🚛 *Select Truck:*\nJob: `{job['name']}`",
+    await query.message.reply_text(
+        f"🚛 *Step 3 of 4 — Select Truck:*\n"
+        f"Job: `{context.user_data['job_name']}`  |  Concrete: `{concrete_type}`",
         parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
     return ASK_PLATE
 
@@ -774,7 +840,10 @@ async def truck_selected_from_list(update: Update, context: ContextTypes.DEFAULT
         return ASK_PLATE_MANUAL
     context.user_data["truck_plate"] = plate
     await query.message.reply_text(
-        f"⚠️ *Confirm:*\n🚛 `{plate}`\n🏗️ `{context.user_data['job_name']}`\n\nCorrect?",
+        f"⚠️ *Confirm:*\n"
+        f"🏗️ `{context.user_data['job_name']}`\n"
+        f"🧱 `{context.user_data['concrete_type']}`\n"
+        f"🚛 `{plate}`\n\nCorrect?",
         parse_mode="Markdown", reply_markup=confirm_plate_kb())
     return CONFIRM_TRIP
 
@@ -783,7 +852,10 @@ async def truck_entered_manually(update: Update, context: ContextTypes.DEFAULT_T
     plate = update.message.text.strip().upper()
     context.user_data["truck_plate"] = plate
     await update.message.reply_text(
-        f"⚠️ *Confirm:*\n🚛 `{plate}`\n🏗️ `{context.user_data['job_name']}`\n\nCorrect?",
+        f"⚠️ *Confirm:*\n"
+        f"🏗️ `{context.user_data['job_name']}`\n"
+        f"🧱 `{context.user_data['concrete_type']}`\n"
+        f"🚛 `{plate}`\n\nCorrect?",
         parse_mode="Markdown", reply_markup=confirm_plate_kb())
     return CONFIRM_TRIP
 
@@ -799,7 +871,10 @@ async def plate_confirmed(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
         return ASK_PLATE
     await query.message.reply_text(
-        f"🧱 *Enter Volume (m³):*\n🚛 `{context.user_data['truck_plate']}`  🏗️ `{context.user_data['job_name']}`",
+        f"🧱 *Step 4 of 4 — Enter Volume (m³):*\n"
+        f"🏗️ `{context.user_data['job_name']}`  "
+        f"🧱 `{context.user_data['concrete_type']}`  "
+        f"🚛 `{context.user_data['truck_plate']}`",
         parse_mode="Markdown")
     return ASK_VOLUME
 
@@ -811,13 +886,15 @@ async def ask_volume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     except ValueError:
         await update.message.reply_text("❌ Enter a valid number (e.g. 8.5)")
         return ASK_VOLUME
-    job_name    = context.user_data["job_name"]
-    truck_plate = context.user_data["truck_plate"]
-    save_trip(update.effective_user.id, job_name, truck_plate, volume)
+    job_name      = context.user_data["job_name"]
+    concrete_type = context.user_data["concrete_type"]
+    truck_plate   = context.user_data["truck_plate"]
+    save_trip(update.effective_user.id, job_name, concrete_type, truck_plate, volume)
     context.user_data.clear()
     await update.message.reply_text(
         f"✅ *Trip Saved!*\n"
-        f"📍 `{job_name}`  🚛 `{truck_plate}`  🧱 `{volume} m³`\n"
+        f"📍 `{job_name}`\n"
+        f"🧱 `{concrete_type}`  🚛 `{truck_plate}`  📦 `{volume} m³`\n"
         f"🕐 `{datetime.now().strftime('%H:%M, %d %b %Y')}`",
         parse_mode="Markdown", reply_markup=trip_done_kb())
     return ConversationHandler.END
@@ -835,10 +912,7 @@ async def cancel_conv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 def main():
     init_db()
 
-    # Start health server in background thread (keeps Render free tier alive)
-    thread = threading.Thread(target=run_health_server, daemon=True)
-    thread.start()
-    logger.warning(f"Health server running on port {PORT}")
+    threading.Thread(target=run_health_server, daemon=True).start()
 
     app = (Application.builder()
            .token(BOT_TOKEN)
@@ -862,6 +936,7 @@ def main():
         entry_points=[CallbackQueryHandler(log_trip_start, pattern="^log_trip$")],
         states={
             ASK_JOB:          [CallbackQueryHandler(job_selected,             pattern="^tripjob_\\d+$")],
+            ASK_CONCRETE:     [CallbackQueryHandler(concrete_selected,        pattern="^concrete_")],
             ASK_PLATE:        [CallbackQueryHandler(truck_selected_from_list, pattern="^truckpick_")],
             ASK_PLATE_MANUAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, truck_entered_manually)],
             CONFIRM_TRIP:     [CallbackQueryHandler(plate_confirmed,           pattern="^plate_confirm_")],
@@ -879,9 +954,9 @@ def main():
     app.add_handler(CallbackQueryHandler(manage_trucks,            pattern="^manage_trucks$"))
     app.add_handler(CallbackQueryHandler(clear_all_trucks_confirm, pattern="^clear_all_trucks$"))
     app.add_handler(CallbackQueryHandler(clear_all_trucks_execute, pattern="^confirm_clear_all_trucks$"))
-    app.add_handler(CallbackQueryHandler(delete_reports_menu,    pattern="^delete_reports_menu$"))
-    app.add_handler(CallbackQueryHandler(delete_reports_confirm, pattern="^del_rep_(daily|weekly|monthly|all)$"))
-    app.add_handler(CallbackQueryHandler(delete_reports_execute, pattern="^confirm_del_rep_(daily|weekly|monthly|all)$"))
+    app.add_handler(CallbackQueryHandler(delete_reports_menu,      pattern="^delete_reports_menu$"))
+    app.add_handler(CallbackQueryHandler(delete_reports_confirm,   pattern="^del_rep_(daily|weekly|monthly|all)$"))
+    app.add_handler(CallbackQueryHandler(delete_reports_execute,   pattern="^confirm_del_rep_(daily|weekly|monthly|all)$"))
     app.add_handler(CallbackQueryHandler(job_status,        pattern="^job_status$"))
     app.add_handler(CallbackQueryHandler(complete_job_menu, pattern="^complete_job$"))
     app.add_handler(CallbackQueryHandler(cancel_job_menu,   pattern="^cancel_job$"))
@@ -895,11 +970,7 @@ def main():
     app.add_handler(CallbackQueryHandler(noop,              pattern="^noop$"))
 
     logger.warning("Bot is running…")
-    app.run_polling(
-        poll_interval=0.5,
-        timeout=10,
-        drop_pending_updates=True,
-    )
+    app.run_polling(poll_interval=0.5, timeout=10, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
