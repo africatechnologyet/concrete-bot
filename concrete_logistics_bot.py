@@ -161,7 +161,7 @@ def cdel_prefix(*ps):
 # DATA LAYER
 # ─────────────────────────────────────────────
 def register_user(uid, uname, role):
-    db("""INSERT INTO users (user_id,username,role) VALUES (%s,%s,%s)
+    db("""INSERT INTO users (user_id,username,role,joined_at) VALUES (%s,%s,%s,NOW())
           ON CONFLICT(user_id) DO UPDATE SET role=EXCLUDED.role,username=EXCLUDED.username""",
        (uid, uname or "", role))
     cdel(f"role_{uid}")
@@ -851,13 +851,17 @@ async def cb_confirm_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # CONFLICT KILLER
 # ─────────────────────────────────────────────
 def kill_webhook():
-    try:
-        r=requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook",
-                        json={"drop_pending_updates":True},timeout=10)
-        log.warning(f"deleteWebhook → {r.json()}")
-    except Exception as e:
-        log.warning(f"deleteWebhook error: {e}")
-    time.sleep(2)
+    """Delete webhook and wait for Telegram to release the session."""
+    for attempt in range(5):
+        try:
+            r=requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook",
+                            json={"drop_pending_updates":True},timeout=10)
+            log.warning(f"deleteWebhook attempt {attempt+1} → {r.json()}")
+            if r.json().get("ok"): break
+        except Exception as e:
+            log.warning(f"deleteWebhook error: {e}")
+        time.sleep(3)
+    time.sleep(5)  # extra wait to let old session die
 
 
 # ─────────────────────────────────────────────
@@ -870,8 +874,8 @@ def main():
 
     app=(Application.builder()
          .token(BOT_TOKEN)
-         .concurrent_updates(True)
-         .connection_pool_size(16)
+         .concurrent_updates(False)
+         .connection_pool_size(8)
          .build())
 
     add_job_conv=ConversationHandler(
@@ -930,8 +934,23 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_confirm_remove,  pattern="^confirmremove_\\d+$"),        group=1)
     app.add_handler(CallbackQueryHandler(cb_noop,            pattern="^noop$"),                        group=1)
 
+    async def error_handler(update, context):
+        err = context.error
+        log.warning(f"Error: {err}")
+        from telegram.error import Conflict, NetworkError
+        if isinstance(err, Conflict):
+            log.warning("Conflict detected — another instance running. Waiting 10s...")
+            time.sleep(10)
+
+    app.add_error_handler(error_handler)
+
     log.warning("Bot is running…")
-    app.run_polling(poll_interval=0.5,timeout=10,drop_pending_updates=True)
+    app.run_polling(
+        poll_interval=1.0,
+        timeout=30,
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES,
+    )
 
 if __name__=="__main__":
     main()
