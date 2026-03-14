@@ -44,8 +44,7 @@ from telegram.ext import (
 # ─────────────────────────────────────────────
 # CONFIG  ← Edit these!
 # ─────────────────────────────────────────────
-import os
-BOT_TOKEN = os.environ["BOT_TOKEN"]
+BOT_TOKEN = "8468077984:AAG_VE2T7oH2y337Tlr7BhX3jmPVAZ0thME"
 
 # Add your Telegram user ID here (and any other admins)
 # To find your ID: message @userinfobot on Telegram
