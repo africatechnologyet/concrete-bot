@@ -253,6 +253,14 @@ def grade_breakdown(name):
     cset(k, rows); return rows
 
 
+
+def get_all_users():
+    return db("SELECT * FROM users ORDER BY joined_at DESC", many=True) or []
+
+def set_user_role(uid, role):
+    db("UPDATE users SET role=%s WHERE user_id=%s", (role, uid))
+    cdel(f"role_{uid}")
+
 # ─────────────────────────────────────────────
 # REPORTS
 # ─────────────────────────────────────────────
@@ -346,7 +354,8 @@ def kb_main(uid):
     if admin:
         kb+=[[InlineKeyboardButton("🗑️ Delete Reports",callback_data="delete_reports_menu")],
              [InlineKeyboardButton("✅ Complete Job",callback_data="complete_job")],
-             [InlineKeyboardButton("❌ Cancel Job",callback_data="cancel_job")]]
+             [InlineKeyboardButton("❌ Cancel Job",callback_data="cancel_job")],
+             [InlineKeyboardButton("👥 Manage Users",callback_data="manage_users")]]
     return InlineKeyboardMarkup(kb)
 
 def kb_trucks():
@@ -606,6 +615,14 @@ async def cb_del_do(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("🏠 Main Menu",callback_data="back_main")]]))
 
 
+
+def get_all_users():
+    return db("SELECT * FROM users ORDER BY joined_at DESC", many=True) or []
+
+def set_user_role(uid, role):
+    db("UPDATE users SET role=%s WHERE user_id=%s", (role, uid))
+    cdel(f"role_{uid}")
+
 # ─────────────────────────────────────────────
 # REPORTS / EXPORT
 # ─────────────────────────────────────────────
@@ -737,6 +754,99 @@ async def conv_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     return ConversationHandler.END
 
 
+
+# ─────────────────────────────────────────────
+# USER MANAGEMENT (admin)
+# ─────────────────────────────────────────────
+async def cb_manage_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query; await q.answer()
+    if not is_admin(q.from_user.id):
+        await q.edit_message_text("🚫 Admins only.",reply_markup=kb_back()); return
+    users=get_all_users()
+    if not users:
+        await q.edit_message_text("👥 *Users*\n\n_No users registered._",
+            parse_mode="Markdown",reply_markup=kb_back()); return
+    kb=[]
+    for u in users:
+        role_icon="👑" if u["role"]=="admin" else "👷"
+        uname=u["username"] or f"id:{u['user_id']}"
+        kb.append([InlineKeyboardButton(
+            f"{role_icon} {uname} — {u['role']}",
+            callback_data=f"userinfo_{u['user_id']}")])
+    kb.append([InlineKeyboardButton("⬅️ Back",callback_data="back_main")])
+    await q.edit_message_text("👥 *User Management*\n━━━━━━━━━━━━━━━━━━━━\n\nSelect a user to manage:",
+        parse_mode="Markdown",reply_markup=InlineKeyboardMarkup(kb))
+
+async def cb_user_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query; await q.answer()
+    if not is_admin(q.from_user.id): return
+    uid=int(q.data.replace("userinfo_",""))
+    users=get_all_users()
+    u=next((x for x in users if x["user_id"]==uid),None)
+    if not u:
+        await q.edit_message_text("User not found.",reply_markup=kb_back()); return
+    role_icon="👑" if u["role"]=="admin" else "👷"
+    uname=u["username"] or f"id:{u['user_id']}"
+    # Toggle button
+    new_role="worker" if u["role"]=="admin" else "admin"
+    new_icon="👷" if new_role=="worker" else "👑"
+    await q.edit_message_text(
+        f"👤 *User Details*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"Name: {uname}\n"
+        f"Role: {role_icon} *{u['role']}*\n"
+        f"ID: `{u['user_id']}`\n"
+        f"Joined: {str(u['joined_at'])[:10]}",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"Change to {new_icon} {new_role}",
+                callback_data=f"setrole_{uid}_{new_role}")],
+            [InlineKeyboardButton("🗑️ Remove User",
+                callback_data=f"removeuser_{uid}")],
+            [InlineKeyboardButton("⬅️ Back",callback_data="manage_users")],
+        ]))
+
+async def cb_set_role(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query; await q.answer()
+    if not is_admin(q.from_user.id): return
+    parts=q.data.replace("setrole_","").split("_")
+    uid=int(parts[0]); new_role=parts[1]
+    set_user_role(uid,new_role)
+    icon="👑" if new_role=="admin" else "👷"
+    await q.edit_message_text(
+        f"✅ User role updated to {icon} *{new_role}*",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("👥 Back to Users",callback_data="manage_users")],
+            [InlineKeyboardButton("🏠 Main Menu",callback_data="back_main")],
+        ]))
+
+async def cb_remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query; await q.answer()
+    if not is_admin(q.from_user.id): return
+    uid=int(q.data.replace("removeuser_",""))
+    users=get_all_users()
+    u=next((x for x in users if x["user_id"]==uid),None)
+    uname=u["username"] if u else str(uid)
+    await q.edit_message_text(
+        f"⚠️ Remove user *{uname}*?\n\nThey will lose access.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Yes, remove",callback_data=f"confirmremove_{uid}")],
+            [InlineKeyboardButton("❌ Cancel",callback_data=f"userinfo_{uid}")],
+        ]))
+
+async def cb_confirm_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query; await q.answer()
+    if not is_admin(q.from_user.id): return
+    uid=int(q.data.replace("confirmremove_",""))
+    db("DELETE FROM users WHERE user_id=%s",(uid,))
+    cdel(f"role_{uid}")
+    await q.edit_message_text("🗑️ User removed.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("👥 Back to Users",callback_data="manage_users")],
+            [InlineKeyboardButton("🏠 Main Menu",callback_data="back_main")],
+        ]))
+
 # ─────────────────────────────────────────────
 # CONFLICT KILLER
 # ─────────────────────────────────────────────
@@ -813,7 +923,12 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_menu_export,     pattern="^menu_export$"),              group=1)
     app.add_handler(CallbackQueryHandler(cb_text_report,     pattern="^rep_(daily|weekly|monthly)$"),group=1)
     app.add_handler(CallbackQueryHandler(cb_excel_report,    pattern="^exp_(daily|weekly|monthly)$"),group=1)
-    app.add_handler(CallbackQueryHandler(cb_noop,            pattern="^noop$"),                     group=1)
+    app.add_handler(CallbackQueryHandler(cb_manage_users,   pattern="^manage_users$"),              group=1)
+    app.add_handler(CallbackQueryHandler(cb_user_info,       pattern="^userinfo_\\d+$"),             group=1)
+    app.add_handler(CallbackQueryHandler(cb_set_role,        pattern="^setrole_\\d+_(admin|worker)$"),group=1)
+    app.add_handler(CallbackQueryHandler(cb_remove_user,     pattern="^removeuser_\\d+$"),           group=1)
+    app.add_handler(CallbackQueryHandler(cb_confirm_remove,  pattern="^confirmremove_\\d+$"),        group=1)
+    app.add_handler(CallbackQueryHandler(cb_noop,            pattern="^noop$"),                        group=1)
 
     log.warning("Bot is running…")
     app.run_polling(poll_interval=0.5,timeout=10,drop_pending_updates=True)
