@@ -118,9 +118,9 @@ def init_db():
                     volume        REAL NOT NULL,
                     logged_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
-                CREATE INDEX IF NOT EXISTS idx_trips_logged   ON trips(logged_at);
-                CREATE INDEX IF NOT EXISTS idx_trips_job      ON trips(job_name);
-                CREATE INDEX IF NOT EXISTS idx_jobs_status    ON jobs(status);
+                
+                
+                
             """)
             conn.commit()
         log.warning("DB ready.")
