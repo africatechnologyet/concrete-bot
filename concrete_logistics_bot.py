@@ -45,7 +45,7 @@ ASK_NEW_TRUCK    = 20
 
 
 # ─────────────────────────────────────────────
-# HEALTH SERVER
+# HEALTH SERVER  (only used in polling/local mode)
 # ─────────────────────────────────────────────
 class _Health(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -868,9 +868,12 @@ def kill_webhook():
 # MAIN
 # ─────────────────────────────────────────────
 def main():
-    kill_webhook()
     init_db()
-    threading.Thread(target=_start_health,daemon=True).start()
+    WEBHOOK_URL = os.environ.get("RENDER_EXTERNAL_URL","")
+    if not WEBHOOK_URL:
+        # local dev only
+        threading.Thread(target=_start_health,daemon=True).start()
+        kill_webhook()
 
     app=(Application.builder()
          .token(BOT_TOKEN)
@@ -935,22 +938,23 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_noop,            pattern="^noop$"),                        group=1)
 
     async def error_handler(update, context):
-        err = context.error
-        log.warning(f"Error: {err}")
-        from telegram.error import Conflict, NetworkError
-        if isinstance(err, Conflict):
-            log.warning("Conflict detected — another instance running. Waiting 10s...")
-            time.sleep(10)
-
+        log.warning(f"Error: {context.error}")
     app.add_error_handler(error_handler)
 
-    log.warning("Bot is running…")
-    app.run_polling(
-        poll_interval=1.0,
-        timeout=30,
-        drop_pending_updates=True,
-        allowed_updates=Update.ALL_TYPES,
-    )
+    WEBHOOK_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
+    if WEBHOOK_URL:
+        # Webhook mode — no conflicts, production ready
+        log.warning(f"Starting webhook on {WEBHOOK_URL}")
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            webhook_url=f"{WEBHOOK_URL}/webhook",
+            drop_pending_updates=True,
+        )
+    else:
+        # Fallback to polling for local dev
+        log.warning("Starting polling (local mode)…")
+        app.run_polling(poll_interval=1.0, timeout=30, drop_pending_updates=True)
 
 if __name__=="__main__":
     main()
