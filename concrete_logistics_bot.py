@@ -1,3 +1,4 @@
+import os
 """
 Concrete Logistics Telegram Bot
 ================================
@@ -44,7 +45,7 @@ from telegram.ext import (
 # ─────────────────────────────────────────────
 # CONFIG  ← Edit these!
 # ─────────────────────────────────────────────
-BOT_TOKEN = "8468077984:AAG_VE2T7oH2y337Tlr7BhX3jmPVAZ0thME"
+BOT_TOKEN = os.environ["BOT_TOKEN"]
 
 # Add your Telegram user ID here (and any other admins)
 # To find your ID: message @userinfobot on Telegram
