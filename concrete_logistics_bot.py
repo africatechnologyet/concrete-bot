@@ -870,7 +870,10 @@ def kill_webhook():
 def main():
     init_db()
     WEBHOOK_URL = os.environ.get("RENDER_EXTERNAL_URL","")
-    if not WEBHOOK_URL:
+    if WEBHOOK_URL:
+        # Delete any existing webhook/polling before setting new one
+        kill_webhook()
+    else:
         # local dev only
         threading.Thread(target=_start_health,daemon=True).start()
         kill_webhook()
