@@ -949,11 +949,12 @@ def main():
         # Webhook mode — no conflicts, production ready
         log.warning(f"Starting webhook on {WEBHOOK_URL}")
         app.run_webhook(
-            url_path="/webhook",
             listen="0.0.0.0",
             port=PORT,
-            webhook_url = f"{WEBHOOK_URL}/webhook"
-        log.warning(f"Starting webhook on {webhook_url}")
+            url_path="/webhook",
+            webhook_url=f"{WEBHOOK_URL}/webhook",
+            drop_pending_updates=True,
+        )
             drop_pending_updates=True,
         )
     else:
