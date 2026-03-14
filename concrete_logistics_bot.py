@@ -183,7 +183,7 @@ def get_trucks():
 
 def add_truck(plate):
     try:
-        db("INSERT INTO trucks (plate) VALUES (%s)", (plate.upper().strip(),))
+        db("INSERT INTO trucks (plate, added_at) VALUES (%s, NOW())", (plate.upper().strip(),))
         cdel("trucks"); return True
     except: return False
 
@@ -201,7 +201,7 @@ def get_job(jid):
     return db("SELECT * FROM jobs WHERE id=%s", (jid,), one=True)
 
 def add_job(name):
-    db("INSERT INTO jobs (name) VALUES (%s)", (name,))
+    db("INSERT INTO jobs (name, status, created_at) VALUES (%s, 'active', NOW())", (name,))
     cdel("jobs_active","jobs_None")
 
 def set_job_status(jid, status):
@@ -209,7 +209,7 @@ def set_job_status(jid, status):
     cdel("jobs_active","jobs_None")
 
 def save_trip(uid, job, grade, plate, vol):
-    db("INSERT INTO trips (user_id,job_name,concrete_grade,truck_plate,volume) VALUES (%s,%s,%s,%s,%s)",
+    db("INSERT INTO trips (user_id,job_name,concrete_grade,truck_plate,volume,logged_at) VALUES (%s,%s,%s,%s,%s,NOW())",
        (uid, job, grade, plate, vol))
     cdel_prefix("trips_","summary_","breakdown_")
 
