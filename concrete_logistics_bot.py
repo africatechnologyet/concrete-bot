@@ -285,8 +285,21 @@ def text_report(period):
     tv=sum(x[0] for x in jobs.values())
     tt=sum(x[1] for x in jobs.values())
     medals=["🥇","🥈","🥉"]
-    jl="\n".join(f"  {i+1}. {n}: *{d[0]:.1f} m³* ({d[1]} trips)"
-                 for i,(n,d) in enumerate(sorted(jobs.items(),key=lambda x:-x[1][0])[:5]))
+    job_grades={}
+    for t in trips:
+        j2=t["job_name"]; g2=t.get("concrete_grade") or "N/A"; v2=float(t["volume"])
+        if j2 not in job_grades: job_grades[j2]={}
+        if g2 not in job_grades[j2]: job_grades[j2][g2]=[0.0,0]
+        job_grades[j2][g2][0]+=v2; job_grades[j2][g2][1]+=1
+    job_lines=[]
+    for i,(n,d) in enumerate(sorted(jobs.items(),key=lambda x:-x[1][0])[:5]):
+        line=f"  {i+1}. *{n}*: *{d[0]:.1f} m³* ({d[1]} trips)"
+        gbd=job_grades.get(n,{})
+        if gbd:
+            gp=" | ".join(f"{g}: {gd[0]:.1f} m³" for g,gd in sorted(gbd.items(),key=lambda x:-x[1][0]))
+            line+=f"\n      🧱 {gp}"
+        job_lines.append(line)
+    jl="\n".join(job_lines)
     gl="\n".join(f"  🧱 {g}: *{d[0]:.1f} m³* ({d[1]} trips)"
                  for g,d in sorted(grades.items(),key=lambda x:-x[1][0]))
     tl="\n".join(f"  {medals[i] if i<3 else '▪️'} {pl}: *{d[0]:.1f} m³* ({d[1]} trips)"
