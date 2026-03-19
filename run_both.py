@@ -1,24 +1,10 @@
-import threading
 import asyncio
-import os
-# Import the main functions from your two bot files
-from concrete_logistics_bot import main as main1
-from bot import main as main2
+from bot import main as start_pi_bot
+from logistics_bot import main as start_logistics_bot
 
-def run_bot1():
-    # We pass stop_signals=None because this is running in a thread
-    asyncio.run(main1())
+async def run():
+    # This runs both bots at the same time without crashing
+    await asyncio.gather(start_pi_bot(), start_logistics_bot())
 
-def run_bot2():
-    # We pass stop_signals=None because this is running in a thread
-    asyncio.run(main2())
-
-if __name__ == "__main__":
-    t1 = threading.Thread(target=run_bot1)
-    t2 = threading.Thread(target=run_bot2)
-
-    t1.start()
-    t2.start()
-
-    t1.join()
-    t2.join()
+if __name__ == '__main__':
+    asyncio.run(run())
