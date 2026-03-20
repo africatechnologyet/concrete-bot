@@ -2,5 +2,6 @@ services:
   - type: worker
     name: concrete-bot
     runtime: python
+    pythonVersion: "3.11.0"
     buildCommand: pip install -r requirements.txt
-    startCommand: python concrete_logistics_bot.py
+    startCommand: python bot.py
