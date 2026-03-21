@@ -544,8 +544,34 @@ async def conv_job_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def conv_job_save(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     name=update.message.text.strip()
-    add_job(name)
-    await update.message.reply_text(f"✅ *Job '{name}' added!*",parse_mode="Markdown",
+    context.user_data["pending_job"]=name
+    existing=job_exists(name)
+    if existing:
+        el="\n".join(f"  - {e}" for e in existing)
+        await update.message.reply_text(
+            f"⚠️ Warning! Active jobs exist for this company:\n\n{el}\n\nAdd new job anyway?",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Yes, add new job",callback_data="job_dup_yes")],
+                [InlineKeyboardButton("❌ No, cancel",callback_data="job_dup_no")]]))
+        return ASK_JOB_DUPLICATE
+    label=add_job(name)
+    await update.message.reply_text(
+        f"✅ Job added!\n\n🏗️ {label}\n🟢 ACTIVE",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🆕 Add Another",callback_data="add_job")],
+            [InlineKeyboardButton("🏠 Main Menu",callback_data="back_main")]]))
+    return ConversationHandler.END
+
+async def conv_job_dup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    q=update.callback_query; await q.answer()
+    if q.data=="job_dup_no":
+        await q.edit_message_text("❌ Cancelled.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu",callback_data="back_main")]]))
+        return ConversationHandler.END
+    name=context.user_data.get("pending_job","")
+    label=add_job(name)
+    await q.edit_message_text(
+        f"✅ Job added!\n\n🏗️ {label}\n🟢 ACTIVE",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🆕 Add Another",callback_data="add_job")],
             [InlineKeyboardButton("🏠 Main Menu",callback_data="back_main")]]))
