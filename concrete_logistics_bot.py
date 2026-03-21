@@ -40,7 +40,8 @@ log = logging.getLogger(__name__)
 # Conversation states — no overlaps
 (ASK_JOB, ASK_GRADE, ASK_PLATE, ASK_PLATE_MANUAL,
  ASK_VOLUME, CONFIRM_TRIP) = range(6)
-ASK_NEW_JOB_NAME = 10
+ASK_NEW_JOB_NAME  = 10
+ASK_JOB_DUPLICATE = 11
 ASK_NEW_TRUCK    = 20
 
 
@@ -201,8 +202,16 @@ def get_job(jid):
     return db("SELECT * FROM jobs WHERE id=%s", (jid,), one=True)
 
 def add_job(name):
-    db("INSERT INTO jobs (name, status, created_at) VALUES (%s, 'active', NOW())", (name,))
+    from datetime import date as _d
+    label = f"{name} - {_d.today().strftime('%b %d')}"
+    db("INSERT INTO jobs (name, status, created_at) VALUES (%s, 'active', NOW())", (label,))
     cdel("jobs_active","jobs_None")
+    return label
+
+def job_exists(name):
+    rows = db("SELECT name FROM jobs WHERE status='active' AND name LIKE %s",
+              (f"{name} -%",), many=True) or []
+    return [r["name"] for r in rows]
 
 def set_job_status(jid, status):
     db("UPDATE jobs SET status=%s,updated_at=NOW() WHERE id=%s", (status, jid))
@@ -899,7 +908,10 @@ def main():
 
     add_job_conv=ConversationHandler(
         entry_points=[CallbackQueryHandler(conv_job_start,pattern="^add_job$")],
-        states={ASK_NEW_JOB_NAME:[MessageHandler(filters.TEXT&~filters.COMMAND,conv_job_save)]},
+        states={
+            ASK_NEW_JOB_NAME:[MessageHandler(filters.TEXT&~filters.COMMAND,conv_job_save)],
+            ASK_JOB_DUPLICATE:[CallbackQueryHandler(conv_job_dup,pattern="^job_dup_(yes|no)$")],
+        },
         fallbacks=[CommandHandler("cancel",conv_cancel)],
         allow_reentry=True,
     )
