@@ -87,18 +87,18 @@ def step_header(step: int, total: int, label: str) -> str:
 
 # ── PDF Generation ──
 
-# Brand palette
-NAVY       = colors.HexColor('#1a3a6b')
-NAVY_LIGHT = colors.HexColor('#2a5298')
-ORANGE     = colors.HexColor('#d2691e')
-PUMP_BLUE  = colors.HexColor('#ddeeff')
-GOLD       = colors.HexColor('#c9a84c')
-GREY_DARK  = colors.HexColor('#333333')
-GREY_MID   = colors.HexColor('#666666')
-GREY_LIGHT = colors.HexColor('#dddddd')
-CREAM      = colors.HexColor('#f9f6f0')
-SUBTOTAL_BG= colors.HexColor('#eef2f8')
-GRAND_BG   = colors.HexColor('#1a3a6b')
+# ── Brand palette ──
+MAIN_ORANGE = colors.HexColor('#EF662C')  # New Primary Color
+NAVY_LIGHT  = colors.HexColor('#2a5298')
+ORANGE_OLD  = colors.HexColor('#d2691e')
+PUMP_BLUE   = colors.HexColor('#ddeeff')
+GOLD        = colors.HexColor('#c9a84c')
+GREY_DARK   = colors.HexColor('#333333')
+GREY_MID    = colors.HexColor('#666666')
+GREY_LIGHT  = colors.HexColor('#dddddd')
+CREAM       = colors.HexColor('#f9f6f0')
+SUBTOTAL_BG = colors.HexColor('#eef2f8')
+GRAND_BG    = colors.HexColor('#EF662C') # Changed to your new Orange
 
 
 def generate_pdf(pi_data: dict) -> BytesIO:
