@@ -984,36 +984,58 @@ async def cb_manage_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="MarkdownV2",reply_markup=InlineKeyboardMarkup(kb))
 
 async def cb_user_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q=update.callback_query; await q.answer()
-    if not is_admin(q.from_user.id): return
-    # Extract user_id safely — the ID can be very large so we split carefully
-    target_uid = int(q.data[len("userinfo_"):])
+    q = update.callback_query
+    await q.answer()
+
+    if not is_admin(q.from_user.id):
+        return
+
+    uid = int(q.data.replace("userinfo_", ""))
     users = get_all_users()
-    u = next((x for x in users if x["user_id"] == target_uid), None)
+    u = next((x for x in users if x["user_id"] == uid), None)
+
     if not u:
-        await q.edit_message_text("⚠️ User not found.",reply_markup=kb_back()); return
-    role_icon = "👑" if u["role"]=="admin" else "👷"
+        await q.edit_message_text(
+            "User not found.",
+            reply_markup=kb_back()
+        )
+        return
+
+    role_icon = "👑" if u["role"] == "admin" else "👷"
+    new_role = "worker" if u["role"] == "admin" else "admin"
+    new_icon = "👷" if new_role == "worker" else "👑"
+
     uname = (u["username"] or f"id:{u['user_id']}").replace("_", "\\_")
-    new_role = "worker" if u["role"]=="admin" else "admin"
-    new_icon = "👷" if new_role=="worker" else "👑"
-    # Encode as uid|role to avoid ambiguity in patterns
+
     await q.edit_message_text(
-        f"👤 *User Details*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"👤 *User Details*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
         f"Name: {uname}\n"
         f"Role: {role_icon} *{u['role']}*\n"
         f"ID: `{u['user_id']}`\n"
         f"Joined: {str(u['joined_at'])[:10]}",
-        parse_mode="Markdown",
+        parse_mode="MarkdownV2",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton(
-                f"Change to {new_icon} {new_role}",
-                callback_data=f"setrole_{target_uid}_{new_role}")],
-            [InlineKeyboardButton(
-                "🗑️ Remove User",
-                callback_data=f"removeuser_{target_uid}")],
-            [InlineKeyboardButton("⬅️ Back", callback_data="manage_users")],
-        ]))
-
+            [
+                InlineKeyboardButton(
+                    f"Change to {new_icon} {new_role}",
+                    callback_data=f"setrole_{uid}_{new_role}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🗑️ Remove User",
+                    callback_data=f"removeuser_{uid}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "⬅️ Back",
+                    callback_data="manage_users"
+                )
+            ]
+        ])
+    )
 async def cb_set_role(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query; await q.answer()
     if not is_admin(q.from_user.id): return
