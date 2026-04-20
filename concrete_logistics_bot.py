@@ -969,17 +969,19 @@ async def cb_manage_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not users:
         await q.edit_message_text("👥 *Users*\n\n_No users registered._",
             parse_mode="Markdown",reply_markup=kb_back()); return
-    kb=[]
-    for u in users:
+   kb = []
+   for u in users:
     role_icon = "👑" if u["role"] == "admin" else "👷"
     uname = (u["username"] or f"id:{u['user_id']}").replace("_", "\\_")
-    kb.append([InlineKeyboardButton(
-        f"{role_icon} {uname} — {u['role']}",
-        callback_data=f"userinfo_{u['user_id']}"
-    )])
+    kb.append([
+        InlineKeyboardButton(
+            f"{role_icon} {uname} — {u['role']}",
+            callback_data=f"userinfo_{u['user_id']}"
+        )
+    ])
     await q.edit_message_text(
         "👥 *User Management*\n━━━━━━━━━━━━━━━━━━━━\n\nSelect a user to manage:",
-        parse_mode="Markdown",reply_markup=InlineKeyboardMarkup(kb))
+        parse_mode="MarkdownV2",reply_markup=InlineKeyboardMarkup(kb))
 
 async def cb_user_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query; await q.answer()
