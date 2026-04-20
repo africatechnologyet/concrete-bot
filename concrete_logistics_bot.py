@@ -42,7 +42,11 @@ log = logging.getLogger(__name__)
  ASK_VOLUME, CONFIRM_TRIP) = range(6)
 ASK_NEW_JOB_NAME  = 10
 ASK_JOB_DUPLICATE = 11
-ASK_NEW_TRUCK    = 20
+ASK_NEW_TRUCK     = 20
+
+# Custom date range conversation states
+ASK_DATE_FROM = 30
+ASK_DATE_TO   = 31
 
 
 # ─────────────────────────────────────────────
@@ -87,7 +91,6 @@ def init_db():
     conn = get_pool().getconn()
     try:
         with conn.cursor() as cur:
-            # Create tables
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     user_id   BIGINT PRIMARY KEY,
@@ -116,7 +119,6 @@ def init_db():
                 );
             """)
             conn.commit()
-            # Safe migrations
             cur.execute("""
                 DO $$ BEGIN
                     IF EXISTS (SELECT 1 FROM information_schema.columns
@@ -134,7 +136,6 @@ def init_db():
                 END $$;
             """)
             conn.commit()
-            # Indexes after columns exist
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_trips_logged ON trips(logged_at);
                 CREATE INDEX IF NOT EXISTS idx_trips_job    ON trips(job_name);
@@ -237,6 +238,14 @@ def fetch_trips(period):
     rows = db(f"SELECT * FROM trips WHERE {wh} ORDER BY logged_at DESC", p, many=True) or []
     cset(k, rows); return rows
 
+def fetch_trips_range(d_from: date, d_to: date):
+    """Fetch trips between two dates inclusive. Not cached (one-off query)."""
+    rows = db(
+        "SELECT * FROM trips WHERE logged_at::date >= %s AND logged_at::date <= %s ORDER BY logged_at DESC",
+        (d_from, d_to), many=True
+    ) or []
+    return rows
+
 def delete_trips(period):
     if period == "all": n = db("DELETE FROM trips", rc=True)
     else:
@@ -261,14 +270,13 @@ def grade_breakdown(name):
               (name,), many=True) or []
     cset(k, rows); return rows
 
-
-
 def get_all_users():
     return db("SELECT * FROM users ORDER BY joined_at DESC", many=True) or []
 
 def set_user_role(uid, role):
     db("UPDATE users SET role=%s WHERE user_id=%s", (role, uid))
     cdel(f"role_{uid}")
+
 
 # ─────────────────────────────────────────────
 # REPORTS
@@ -281,9 +289,9 @@ def plabel(p):
         return f"Week {m.strftime('%b %d')}–{(m+timedelta(6)).strftime('%b %d, %Y')}"
     return f"Month of {t.strftime('%B %Y')}"
 
-def text_report(period):
-    trips = fetch_trips(period)
-    if not trips: return f"📋 *{plabel(period)}*\n\n_No trips recorded._"
+def _build_report_text(trips, label):
+    """Shared report builder used by both period and custom range reports."""
+    if not trips: return f"📋 *{label}*\n\n_No trips recorded._"
     jobs:dict={}; trucks:dict={}; grades:dict={}
     for t in trips:
         j=t["job_name"]; p=t["truck_plate"]
@@ -313,14 +321,17 @@ def text_report(period):
                  for g,d in sorted(grades.items(),key=lambda x:-x[1][0]))
     tl="\n".join(f"  {medals[i] if i<3 else '▪️'} {pl}: *{d[0]:.1f} m³* ({d[1]} trips)"
                  for i,(pl,d) in enumerate(sorted(trucks.items(),key=lambda x:-x[1][0])))
-    return (f"📋 *{plabel(period)}*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+    return (f"📋 *{label}*\n━━━━━━━━━━━━━━━━━━━━\n\n"
             f"📅 *Jobs*\n{jl}\n  ───────\n  *{tv:.1f} m³ | {tt} trips*\n\n"
             f"🧱 *Concrete Grades*\n{gl}\n\n"
             f"🚛 *Trucks*\n{tl}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n_Generated {datetime.now().strftime('%H:%M %d %b %Y')}_")
 
-def excel_report(period):
-    trips = fetch_trips(period)
+def text_report(period):
+    return _build_report_text(fetch_trips(period), plabel(period))
+
+def _build_excel(trips, label):
+    """Shared Excel builder used by both period and custom range exports."""
     wb = openpyxl.Workbook()
     ws = wb.active; ws.title="Trips"
     hf=Font(bold=True,color="FFFFFF"); hfill=PatternFill("solid",fgColor="1F4E79")
@@ -356,6 +367,9 @@ def excel_report(period):
     _sh("Trucks",["Rank","Truck","m³","Trips"],
         [[i,pl,round(v,2),tr] for i,(pl,(v,tr)) in enumerate(sorted(tt2.items(),key=lambda x:-x[1][0]),1)])
     buf=io.BytesIO(); wb.save(buf); buf.seek(0); return buf
+
+def excel_report(period):
+    return _build_excel(fetch_trips(period), plabel(period))
 
 
 # ─────────────────────────────────────────────
@@ -404,6 +418,22 @@ def kb_trip_done():
         [InlineKeyboardButton("➕ Log Another Trip",callback_data="log_trip")],
         [InlineKeyboardButton("📊 View Reports",callback_data="menu_reports")],
         [InlineKeyboardButton("🏠 Main Menu",callback_data="back_main")]])
+
+def kb_period_reports():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📅 Today",        callback_data="rep_daily")],
+        [InlineKeyboardButton("🗓️ This Week",    callback_data="rep_weekly")],
+        [InlineKeyboardButton("📆 This Month",   callback_data="rep_monthly")],
+        [InlineKeyboardButton("🗂️ Custom Range", callback_data="custom_rep")],
+        [InlineKeyboardButton("⬅️ Back",         callback_data="back_main")]])
+
+def kb_period_export():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📅 Today",        callback_data="exp_daily")],
+        [InlineKeyboardButton("🗓️ This Week",    callback_data="exp_weekly")],
+        [InlineKeyboardButton("📆 This Month",   callback_data="exp_monthly")],
+        [InlineKeyboardButton("🗂️ Custom Range", callback_data="custom_exp")],
+        [InlineKeyboardButton("⬅️ Back",         callback_data="back_main")]])
 
 
 # ─────────────────────────────────────────────
@@ -579,7 +609,7 @@ async def conv_job_dup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
 
 # ─────────────────────────────────────────────
-# COMPLETE / CANCEL JOB
+# COMPLETE / CANCEL JOB  — with confirmation screen
 # ─────────────────────────────────────────────
 async def cb_complete_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query; await q.answer()
@@ -588,20 +618,49 @@ async def cb_complete_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     jobs=get_jobs(status="active")
     if not jobs:
         await q.edit_message_text("_No active jobs._",parse_mode="Markdown",reply_markup=kb_back()); return
-    kb=[[InlineKeyboardButton(f"🏗️ {j['name']}",callback_data=f"do_complete_{j['id']}")] for j in jobs]
+    kb=[[InlineKeyboardButton(f"🏗️ {j['name']}",callback_data=f"pre_complete_{j['id']}")] for j in jobs]
     kb.append([InlineKeyboardButton("⬅️ Back",callback_data="back_main")])
     await q.edit_message_text("✅ *Select job to complete:*",parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(kb))
 
+async def cb_pre_complete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Confirmation screen before completing a job."""
+    q=update.callback_query; await q.answer()
+    if not is_admin(q.from_user.id): return
+    jid=int(q.data.replace("pre_complete_",""))
+    j=get_job(jid)
+    if not j:
+        await q.edit_message_text("⚠️ Job not found.",reply_markup=kb_back()); return
+    s=job_summary(j["name"])
+    bd=grade_breakdown(j["name"])
+    grade_lines=""
+    if bd:
+        grade_lines="\n"+"\n".join(
+            f"   🧱 {r['concrete_grade']}: *{float(r['vol']):.1f} m³* ({r['trips']} trips)"
+            for r in bd)
+    await q.edit_message_text(
+        f"✅ *Complete Job — Confirm*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🏗️ *{j['name']}*\n"
+        f"📦 Total: *{float(s['vol']):.1f} m³* | *{s['trips']} trips*"
+        f"{grade_lines}\n\n"
+        f"⚠️ This will mark the job as *completed*.\nAre you sure?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Yes, complete it",callback_data=f"do_complete_{jid}")],
+            [InlineKeyboardButton("❌ No, go back",     callback_data="complete_job")]]))
+
 async def cb_do_complete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query; await q.answer()
+    if not is_admin(q.from_user.id): return
     jid=int(q.data.replace("do_complete_",""))
     j=get_job(jid)
     if j:
         set_job_status(jid,"completed")
         s=job_summary(j["name"])
         await q.edit_message_text(
-            f"✅ *{j['name']}* completed!\n📦 {float(s['vol']):.1f} m³ | {s['trips']} trips",
+            f"✅ *Job Completed!*\n\n"
+            f"🏗️ *{j['name']}*\n"
+            f"📦 *{float(s['vol']):.1f} m³* | *{s['trips']} trips*",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu",callback_data="back_main")]]))
 
@@ -612,18 +671,47 @@ async def cb_cancel_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     jobs=get_jobs(status="active")
     if not jobs:
         await q.edit_message_text("_No active jobs._",parse_mode="Markdown",reply_markup=kb_back()); return
-    kb=[[InlineKeyboardButton(f"🏗️ {j['name']}",callback_data=f"do_cancel_{j['id']}")] for j in jobs]
+    kb=[[InlineKeyboardButton(f"🏗️ {j['name']}",callback_data=f"pre_cancel_{j['id']}")] for j in jobs]
     kb.append([InlineKeyboardButton("⬅️ Back",callback_data="back_main")])
     await q.edit_message_text("❌ *Select job to cancel:*",parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(kb))
 
+async def cb_pre_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Confirmation screen before cancelling a job."""
+    q=update.callback_query; await q.answer()
+    if not is_admin(q.from_user.id): return
+    jid=int(q.data.replace("pre_cancel_",""))
+    j=get_job(jid)
+    if not j:
+        await q.edit_message_text("⚠️ Job not found.",reply_markup=kb_back()); return
+    s=job_summary(j["name"])
+    bd=grade_breakdown(j["name"])
+    grade_lines=""
+    if bd:
+        grade_lines="\n"+"\n".join(
+            f"   🧱 {r['concrete_grade']}: *{float(r['vol']):.1f} m³* ({r['trips']} trips)"
+            for r in bd)
+    await q.edit_message_text(
+        f"❌ *Cancel Job — Confirm*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🏗️ *{j['name']}*\n"
+        f"📦 Total: *{float(s['vol']):.1f} m³* | *{s['trips']} trips*"
+        f"{grade_lines}\n\n"
+        f"⚠️ This will mark the job as *cancelled*.\nAre you sure?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Yes, cancel it", callback_data=f"do_cancel_{jid}")],
+            [InlineKeyboardButton("❌ No, go back",    callback_data="cancel_job")]]))
+
 async def cb_do_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query; await q.answer()
+    if not is_admin(q.from_user.id): return
     jid=int(q.data.replace("do_cancel_",""))
     j=get_job(jid)
     if j:
         set_job_status(jid,"cancelled")
-        await q.edit_message_text(f"❌ *{j['name']}* cancelled.",parse_mode="Markdown",
+        await q.edit_message_text(
+            f"❌ *Job Cancelled*\n\n🏗️ *{j['name']}*",
+            parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu",callback_data="back_main")]]))
 
 
@@ -663,34 +751,18 @@ async def cb_del_do(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("🏠 Main Menu",callback_data="back_main")]]))
 
 
-
-def get_all_users():
-    return db("SELECT * FROM users ORDER BY joined_at DESC", many=True) or []
-
-def set_user_role(uid, role):
-    db("UPDATE users SET role=%s WHERE user_id=%s", (role, uid))
-    cdel(f"role_{uid}")
-
 # ─────────────────────────────────────────────
 # REPORTS / EXPORT
 # ─────────────────────────────────────────────
 async def cb_menu_reports(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query; await q.answer()
     await q.edit_message_text("📊 *Select period:*",parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("📅 Today",callback_data="rep_daily")],
-            [InlineKeyboardButton("🗓️ This Week",callback_data="rep_weekly")],
-            [InlineKeyboardButton("📆 This Month",callback_data="rep_monthly")],
-            [InlineKeyboardButton("⬅️ Back",callback_data="back_main")]]))
+        reply_markup=kb_period_reports())
 
 async def cb_menu_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query; await q.answer()
     await q.edit_message_text("📥 *Export to Excel:*",parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("📅 Today",callback_data="exp_daily")],
-            [InlineKeyboardButton("🗓️ This Week",callback_data="exp_weekly")],
-            [InlineKeyboardButton("📆 This Month",callback_data="exp_monthly")],
-            [InlineKeyboardButton("⬅️ Back",callback_data="back_main")]]))
+        reply_markup=kb_period_export())
 
 async def cb_text_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query; period=q.data.replace("rep_",""); await q.answer()
@@ -705,6 +777,90 @@ async def cb_excel_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id=q.message.chat_id,
         document=InputFile(buf,filename=f"trips_{period}_{date.today()}.xlsx"),
         caption=f"📥 *{plabel(period)}*",parse_mode="Markdown")
+
+
+# ─────────────────────────────────────────────
+# CUSTOM DATE RANGE — Conversation Handler
+# ─────────────────────────────────────────────
+def _parse_date(text: str) -> Optional[date]:
+    """Try multiple date formats: DD/MM/YYYY, DD-MM-YYYY, YYYY-MM-DD."""
+    for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d", "%d/%m/%y", "%d-%m-%y"):
+        try:
+            return datetime.strptime(text.strip(), fmt).date()
+        except ValueError:
+            continue
+    return None
+
+async def conv_custom_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Entry point: triggered by custom_rep or custom_exp callback."""
+    q=update.callback_query; await q.answer()
+    if not get_role(q.from_user.id):
+        await q.edit_message_text("🚫 Access denied."); return ConversationHandler.END
+    # Store whether this is a report or export
+    context.user_data["custom_mode"] = "exp" if q.data == "custom_exp" else "rep"
+    await q.message.reply_text(
+        "🗂️ *Custom Date Range*\n\n"
+        "Enter the *start date*:\n"
+        "Format: `DD/MM/YYYY`  (e.g. `01/03/2025`)",
+        parse_mode="Markdown")
+    return ASK_DATE_FROM
+
+async def conv_custom_from(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    d = _parse_date(update.message.text)
+    if not d:
+        await update.message.reply_text(
+            "❌ Invalid date. Please use `DD/MM/YYYY` format (e.g. `01/03/2025`)",
+            parse_mode="Markdown")
+        return ASK_DATE_FROM
+    context.user_data["date_from"] = d
+    await update.message.reply_text(
+        f"✅ Start: *{d.strftime('%d %b %Y')}*\n\n"
+        f"Now enter the *end date*:\n"
+        f"Format: `DD/MM/YYYY`",
+        parse_mode="Markdown")
+    return ASK_DATE_TO
+
+async def conv_custom_to(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    d_to = _parse_date(update.message.text)
+    if not d_to:
+        await update.message.reply_text(
+            "❌ Invalid date. Please use `DD/MM/YYYY` format (e.g. `30/03/2025`)",
+            parse_mode="Markdown")
+        return ASK_DATE_TO
+    d_from = context.user_data.get("date_from")
+    if d_to < d_from:
+        await update.message.reply_text(
+            f"❌ End date (*{d_to.strftime('%d %b %Y')}*) must be on or after "
+            f"start date (*{d_from.strftime('%d %b %Y')}*).\n\nTry again:",
+            parse_mode="Markdown")
+        return ASK_DATE_TO
+
+    mode = context.user_data.get("custom_mode","rep")
+    label = f"{d_from.strftime('%d %b')} – {d_to.strftime('%d %b %Y')}"
+    trips = fetch_trips_range(d_from, d_to)
+    context.user_data.clear()
+
+    if mode == "exp":
+        if not trips:
+            await update.message.reply_text(
+                f"📥 *{label}*\n\n_No trips in this range._",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu",callback_data="back_main")]]))
+            return ConversationHandler.END
+        buf = _build_excel(trips, label)
+        safe = label.replace(" ","_").replace("–","-")
+        await update.message.reply_document(
+            document=InputFile(buf, filename=f"trips_{safe}.xlsx"),
+            caption=f"📥 *{label}*  ({len(trips)} trips)",
+            parse_mode="Markdown")
+    else:
+        await update.message.reply_text(
+            _build_report_text(trips, label),
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📊 View Reports",callback_data="menu_reports")],
+                [InlineKeyboardButton("🏠 Main Menu",  callback_data="back_main")]]))
+    return ConversationHandler.END
 
 
 # ─────────────────────────────────────────────
@@ -802,9 +958,8 @@ async def conv_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     return ConversationHandler.END
 
 
-
 # ─────────────────────────────────────────────
-# USER MANAGEMENT (admin)
+# USER MANAGEMENT (admin) — fixed
 # ─────────────────────────────────────────────
 async def cb_manage_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query; await q.answer()
@@ -822,22 +977,24 @@ async def cb_manage_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{role_icon} {uname} — {u['role']}",
             callback_data=f"userinfo_{u['user_id']}")])
     kb.append([InlineKeyboardButton("⬅️ Back",callback_data="back_main")])
-    await q.edit_message_text("👥 *User Management*\n━━━━━━━━━━━━━━━━━━━━\n\nSelect a user to manage:",
+    await q.edit_message_text(
+        "👥 *User Management*\n━━━━━━━━━━━━━━━━━━━━\n\nSelect a user to manage:",
         parse_mode="Markdown",reply_markup=InlineKeyboardMarkup(kb))
 
 async def cb_user_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query; await q.answer()
     if not is_admin(q.from_user.id): return
-    uid=int(q.data.replace("userinfo_",""))
-    users=get_all_users()
-    u=next((x for x in users if x["user_id"]==uid),None)
+    # Extract user_id safely — the ID can be very large so we split carefully
+    target_uid = int(q.data[len("userinfo_"):])
+    users = get_all_users()
+    u = next((x for x in users if x["user_id"] == target_uid), None)
     if not u:
-        await q.edit_message_text("User not found.",reply_markup=kb_back()); return
-    role_icon="👑" if u["role"]=="admin" else "👷"
-    uname=u["username"] or f"id:{u['user_id']}"
-    # Toggle button
-    new_role="worker" if u["role"]=="admin" else "admin"
-    new_icon="👷" if new_role=="worker" else "👑"
+        await q.edit_message_text("⚠️ User not found.",reply_markup=kb_back()); return
+    role_icon = "👑" if u["role"]=="admin" else "👷"
+    uname = u["username"] or f"id:{u['user_id']}"
+    new_role = "worker" if u["role"]=="admin" else "admin"
+    new_icon = "👷" if new_role=="worker" else "👑"
+    # Encode as uid|role to avoid ambiguity in patterns
     await q.edit_message_text(
         f"👤 *User Details*\n━━━━━━━━━━━━━━━━━━━━\n\n"
         f"Name: {uname}\n"
@@ -846,60 +1003,65 @@ async def cb_user_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Joined: {str(u['joined_at'])[:10]}",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"Change to {new_icon} {new_role}",
-                callback_data=f"setrole_{uid}_{new_role}")],
-            [InlineKeyboardButton("🗑️ Remove User",
-                callback_data=f"removeuser_{uid}")],
-            [InlineKeyboardButton("⬅️ Back",callback_data="manage_users")],
+            [InlineKeyboardButton(
+                f"Change to {new_icon} {new_role}",
+                callback_data=f"setrole_{target_uid}_{new_role}")],
+            [InlineKeyboardButton(
+                "🗑️ Remove User",
+                callback_data=f"removeuser_{target_uid}")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="manage_users")],
         ]))
 
 async def cb_set_role(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query; await q.answer()
     if not is_admin(q.from_user.id): return
-    parts=q.data.replace("setrole_","").split("_")
-    uid=int(parts[0]); new_role=parts[1]
-    set_user_role(uid,new_role)
-    icon="👑" if new_role=="admin" else "👷"
+    # data format: setrole_{uid}_{role}  — role is always last segment
+    raw = q.data[len("setrole_"):]
+    # new_role is always "admin" or "worker" — split from the right
+    new_role = raw.rsplit("_", 1)[1]
+    target_uid = int(raw.rsplit("_", 1)[0])
+    set_user_role(target_uid, new_role)
+    icon = "👑" if new_role=="admin" else "👷"
     await q.edit_message_text(
-        f"✅ User role updated to {icon} *{new_role}*",
+        f"✅ Role updated to {icon} *{new_role}*",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("👥 Back to Users",callback_data="manage_users")],
-            [InlineKeyboardButton("🏠 Main Menu",callback_data="back_main")],
+            [InlineKeyboardButton("👥 Back to Users", callback_data="manage_users")],
+            [InlineKeyboardButton("🏠 Main Menu",     callback_data="back_main")],
         ]))
 
 async def cb_remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query; await q.answer()
     if not is_admin(q.from_user.id): return
-    uid=int(q.data.replace("removeuser_",""))
-    users=get_all_users()
-    u=next((x for x in users if x["user_id"]==uid),None)
-    uname=u["username"] if u else str(uid)
+    target_uid = int(q.data[len("removeuser_"):])
+    users = get_all_users()
+    u = next((x for x in users if x["user_id"] == target_uid), None)
+    uname = u["username"] if u and u["username"] else str(target_uid)
     await q.edit_message_text(
-        f"⚠️ Remove user *{uname}*?\n\nThey will lose access.",
+        f"⚠️ Remove user *{uname}*?\n\nThey will lose all access.",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Yes, remove",callback_data=f"confirmremove_{uid}")],
-            [InlineKeyboardButton("❌ Cancel",callback_data=f"userinfo_{uid}")],
+            [InlineKeyboardButton("✅ Yes, remove",   callback_data=f"confirmremove_{target_uid}")],
+            [InlineKeyboardButton("❌ Cancel",        callback_data=f"userinfo_{target_uid}")],
         ]))
 
 async def cb_confirm_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query; await q.answer()
     if not is_admin(q.from_user.id): return
-    uid=int(q.data.replace("confirmremove_",""))
-    db("DELETE FROM users WHERE user_id=%s",(uid,))
-    cdel(f"role_{uid}")
+    target_uid = int(q.data[len("confirmremove_"):])
+    db("DELETE FROM users WHERE user_id=%s", (target_uid,))
+    cdel(f"role_{target_uid}")
     await q.edit_message_text("🗑️ User removed.",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("👥 Back to Users",callback_data="manage_users")],
-            [InlineKeyboardButton("🏠 Main Menu",callback_data="back_main")],
+            [InlineKeyboardButton("👥 Back to Users", callback_data="manage_users")],
+            [InlineKeyboardButton("🏠 Main Menu",     callback_data="back_main")],
         ]))
+
 
 # ─────────────────────────────────────────────
 # CONFLICT KILLER
 # ─────────────────────────────────────────────
 def kill_webhook():
-    """Delete webhook and wait for Telegram to release the session."""
     for attempt in range(5):
         try:
             r=requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook",
@@ -909,7 +1071,7 @@ def kill_webhook():
         except Exception as e:
             log.warning(f"deleteWebhook error: {e}")
         time.sleep(3)
-    time.sleep(5)  # extra wait to let old session die
+    time.sleep(5)
 
 
 # ─────────────────────────────────────────────
@@ -919,10 +1081,8 @@ def main():
     init_db()
     WEBHOOK_URL = os.environ.get("RENDER_EXTERNAL_URL","")
     if WEBHOOK_URL:
-        # Delete any existing webhook/polling before setting new one
         kill_webhook()
     else:
-        # local dev only
         threading.Thread(target=_start_health,daemon=True).start()
         kill_webhook()
 
@@ -935,7 +1095,7 @@ def main():
     add_job_conv=ConversationHandler(
         entry_points=[CallbackQueryHandler(conv_job_start,pattern="^add_job$")],
         states={
-            ASK_NEW_JOB_NAME:[MessageHandler(filters.TEXT&~filters.COMMAND,conv_job_save)],
+            ASK_NEW_JOB_NAME: [MessageHandler(filters.TEXT&~filters.COMMAND,conv_job_save)],
             ASK_JOB_DUPLICATE:[CallbackQueryHandler(conv_job_dup,pattern="^job_dup_(yes|no)$")],
         },
         fallbacks=[CommandHandler("cancel",conv_cancel)],
@@ -950,46 +1110,59 @@ def main():
     log_trip_conv=ConversationHandler(
         entry_points=[CallbackQueryHandler(conv_trip_start,pattern="^log_trip$")],
         states={
-            ASK_JOB:          [CallbackQueryHandler(conv_trip_job,         pattern="^tj_\\d+$")],
-            ASK_GRADE:        [CallbackQueryHandler(conv_trip_grade,       pattern="^grade_")],
-            ASK_PLATE:        [CallbackQueryHandler(conv_trip_plate_list,  pattern="^tp_")],
+            ASK_JOB:          [CallbackQueryHandler(conv_trip_job,        pattern="^tj_\\d+$")],
+            ASK_GRADE:        [CallbackQueryHandler(conv_trip_grade,      pattern="^grade_")],
+            ASK_PLATE:        [CallbackQueryHandler(conv_trip_plate_list, pattern="^tp_")],
             ASK_PLATE_MANUAL: [MessageHandler(filters.TEXT&~filters.COMMAND,conv_trip_plate_manual)],
-            CONFIRM_TRIP:     [CallbackQueryHandler(conv_trip_confirm,     pattern="^plate_(yes|no)$")],
+            CONFIRM_TRIP:     [CallbackQueryHandler(conv_trip_confirm,    pattern="^plate_(yes|no)$")],
             ASK_VOLUME:       [MessageHandler(filters.TEXT&~filters.COMMAND,conv_trip_volume)],
         },
         fallbacks=[CommandHandler("cancel",conv_cancel)],
         allow_reentry=True,
     )
+    # Custom date range conversation (reports + export)
+    custom_range_conv=ConversationHandler(
+        entry_points=[CallbackQueryHandler(conv_custom_start, pattern="^custom_(rep|exp)$")],
+        states={
+            ASK_DATE_FROM: [MessageHandler(filters.TEXT&~filters.COMMAND, conv_custom_from)],
+            ASK_DATE_TO:   [MessageHandler(filters.TEXT&~filters.COMMAND, conv_custom_to)],
+        },
+        fallbacks=[CommandHandler("cancel", conv_cancel)],
+        allow_reentry=True,
+    )
 
-    # Register conversation handlers first (group 0)
-    app.add_handler(add_job_conv,   group=0)
-    app.add_handler(add_truck_conv, group=0)
-    app.add_handler(log_trip_conv,  group=0)
+    # Conversation handlers first (group 0)
+    app.add_handler(add_job_conv,      group=0)
+    app.add_handler(add_truck_conv,    group=0)
+    app.add_handler(log_trip_conv,     group=0)
+    app.add_handler(custom_range_conv, group=0)
 
-    # Then all other handlers (group 1)
-    app.add_handler(CommandHandler("start",cmd_start),                                              group=1)
-    app.add_handler(CallbackQueryHandler(cb_back_main,       pattern="^back_main$"),                group=1)
-    app.add_handler(CallbackQueryHandler(cb_job_status,      pattern="^job_status$"),               group=1)
-    app.add_handler(CallbackQueryHandler(cb_manage_trucks,   pattern="^manage_trucks$"),            group=1)
-    app.add_handler(CallbackQueryHandler(cb_clear_trucks_ask,pattern="^clear_trucks$"),             group=1)
-    app.add_handler(CallbackQueryHandler(cb_clear_trucks_do, pattern="^clear_trucks_yes$"),         group=1)
-    app.add_handler(CallbackQueryHandler(cb_complete_menu,   pattern="^complete_job$"),             group=1)
-    app.add_handler(CallbackQueryHandler(cb_cancel_menu,     pattern="^cancel_job$"),               group=1)
-    app.add_handler(CallbackQueryHandler(cb_do_complete,     pattern="^do_complete_\\d+$"),         group=1)
-    app.add_handler(CallbackQueryHandler(cb_do_cancel,       pattern="^do_cancel_\\d+$"),           group=1)
-    app.add_handler(CallbackQueryHandler(cb_del_menu,        pattern="^delete_reports_menu$"),      group=1)
-    app.add_handler(CallbackQueryHandler(cb_del_ask,         pattern="^delask_(daily|weekly|monthly|all)$"), group=1)
-    app.add_handler(CallbackQueryHandler(cb_del_do,          pattern="^deldo_(daily|weekly|monthly|all)$"),  group=1)
-    app.add_handler(CallbackQueryHandler(cb_menu_reports,    pattern="^menu_reports$"),             group=1)
-    app.add_handler(CallbackQueryHandler(cb_menu_export,     pattern="^menu_export$"),              group=1)
-    app.add_handler(CallbackQueryHandler(cb_text_report,     pattern="^rep_(daily|weekly|monthly)$"),group=1)
-    app.add_handler(CallbackQueryHandler(cb_excel_report,    pattern="^exp_(daily|weekly|monthly)$"),group=1)
-    app.add_handler(CallbackQueryHandler(cb_manage_users,   pattern="^manage_users$"),              group=1)
-    app.add_handler(CallbackQueryHandler(cb_user_info,       pattern="^userinfo_\\d+$"),             group=1)
-    app.add_handler(CallbackQueryHandler(cb_set_role,        pattern="^setrole_\\d+_(admin|worker)$"),group=1)
-    app.add_handler(CallbackQueryHandler(cb_remove_user,     pattern="^removeuser_\\d+$"),           group=1)
-    app.add_handler(CallbackQueryHandler(cb_confirm_remove,  pattern="^confirmremove_\\d+$"),        group=1)
-    app.add_handler(CallbackQueryHandler(cb_noop,            pattern="^noop$"),                        group=1)
+    # All other handlers (group 1)
+    app.add_handler(CommandHandler("start", cmd_start),                                              group=1)
+    app.add_handler(CallbackQueryHandler(cb_back_main,        pattern="^back_main$"),                group=1)
+    app.add_handler(CallbackQueryHandler(cb_job_status,       pattern="^job_status$"),               group=1)
+    app.add_handler(CallbackQueryHandler(cb_manage_trucks,    pattern="^manage_trucks$"),            group=1)
+    app.add_handler(CallbackQueryHandler(cb_clear_trucks_ask, pattern="^clear_trucks$"),             group=1)
+    app.add_handler(CallbackQueryHandler(cb_clear_trucks_do,  pattern="^clear_trucks_yes$"),         group=1)
+    app.add_handler(CallbackQueryHandler(cb_complete_menu,    pattern="^complete_job$"),             group=1)
+    app.add_handler(CallbackQueryHandler(cb_cancel_menu,      pattern="^cancel_job$"),               group=1)
+    app.add_handler(CallbackQueryHandler(cb_pre_complete,     pattern="^pre_complete_\\d+$"),        group=1)
+    app.add_handler(CallbackQueryHandler(cb_pre_cancel,       pattern="^pre_cancel_\\d+$"),          group=1)
+    app.add_handler(CallbackQueryHandler(cb_do_complete,      pattern="^do_complete_\\d+$"),         group=1)
+    app.add_handler(CallbackQueryHandler(cb_do_cancel,        pattern="^do_cancel_\\d+$"),           group=1)
+    app.add_handler(CallbackQueryHandler(cb_del_menu,         pattern="^delete_reports_menu$"),      group=1)
+    app.add_handler(CallbackQueryHandler(cb_del_ask,          pattern="^delask_(daily|weekly|monthly|all)$"), group=1)
+    app.add_handler(CallbackQueryHandler(cb_del_do,           pattern="^deldo_(daily|weekly|monthly|all)$"),  group=1)
+    app.add_handler(CallbackQueryHandler(cb_menu_reports,     pattern="^menu_reports$"),             group=1)
+    app.add_handler(CallbackQueryHandler(cb_menu_export,      pattern="^menu_export$"),              group=1)
+    app.add_handler(CallbackQueryHandler(cb_text_report,      pattern="^rep_(daily|weekly|monthly)$"), group=1)
+    app.add_handler(CallbackQueryHandler(cb_excel_report,     pattern="^exp_(daily|weekly|monthly)$"), group=1)
+    app.add_handler(CallbackQueryHandler(cb_manage_users,     pattern="^manage_users$"),             group=1)
+    app.add_handler(CallbackQueryHandler(cb_user_info,        pattern="^userinfo_\\d+$"),            group=1)
+    app.add_handler(CallbackQueryHandler(cb_set_role,         pattern="^setrole_\\d+_(admin|worker)$"), group=1)
+    app.add_handler(CallbackQueryHandler(cb_remove_user,      pattern="^removeuser_\\d+$"),          group=1)
+    app.add_handler(CallbackQueryHandler(cb_confirm_remove,   pattern="^confirmremove_\\d+$"),       group=1)
+    app.add_handler(CallbackQueryHandler(cb_noop,             pattern="^noop$"),                     group=1)
 
     async def error_handler(update, context):
         log.warning(f"Error: {context.error}")
@@ -997,7 +1170,6 @@ def main():
 
     WEBHOOK_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
     if WEBHOOK_URL:
-        # Webhook mode — no conflicts, production ready
         webhook_url = f"{WEBHOOK_URL}/webhook"
         log.warning(f"Starting webhook on {webhook_url}")
         app.run_webhook(
@@ -1009,7 +1181,6 @@ def main():
             secret_token=None,
         )
     else:
-        # Fallback to polling for local dev
         log.warning("Starting polling (local mode)…")
         app.run_polling(poll_interval=1.0, timeout=30, drop_pending_updates=True, stop_signals=None)
 
