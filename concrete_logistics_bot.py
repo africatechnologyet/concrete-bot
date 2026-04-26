@@ -5,7 +5,7 @@ Admin:  https://t.me/MaterialConcretebot?start=Admin
 Worker: https://t.me/MaterialConcretebot?start=Worker
 """
 
-import os, logging, io, threading, time, requests
+import os, logging, io, threading, time, requests, asyncio
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timedelta, date
 from typing import Optional
@@ -18,6 +18,7 @@ from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, ContextTypes, ConversationHandler, filters,
 )
+from telegram.request import HTTPXRequest
 
 # ─────────────────────────────────────────────
 # CONFIG
@@ -37,6 +38,26 @@ CONCRETE_GRADES = [
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.WARNING)
 log = logging.getLogger(__name__)
 
+async def _send_doc_with_retry(bot, chat_id, buf, filename, caption, retries=3):
+    """Send a document, retrying on TimedOut up to `retries` times."""
+    from telegram.error import TimedOut as TGTimedOut
+    for attempt in range(1, retries + 1):
+        try:
+            buf.seek(0)
+            await bot.send_document(
+                chat_id=chat_id,
+                document=InputFile(buf, filename=filename),
+                caption=caption,
+                parse_mode="Markdown",
+            )
+            return
+        except TGTimedOut:
+            if attempt == retries:
+                raise
+            wait = attempt * 3
+            log.warning(f"send_document timed out (attempt {attempt}), retrying in {wait}s…")
+            await asyncio.sleep(wait)
+
 # Conversation states — no overlaps
 (ASK_JOB, ASK_GRADE, ASK_PLATE, ASK_PLATE_MANUAL,
  ASK_VOLUME, CONFIRM_TRIP) = range(6)
@@ -47,6 +68,10 @@ ASK_NEW_TRUCK     = 20
 # Custom date range conversation states
 ASK_DATE_FROM = 30
 ASK_DATE_TO   = 31
+
+# Job order (grade + qty) states — inside add_job conv
+ASK_ORDER_GRADE = 40
+ASK_ORDER_QTY   = 41
 
 
 # ─────────────────────────────────────────────
@@ -142,7 +167,23 @@ def init_db():
                 CREATE INDEX IF NOT EXISTS idx_jobs_status  ON jobs(status);
             """)
             conn.commit()
+            # job_orders: stores ordered qty per grade per job (optional at job creation)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS job_orders (
+                    id           SERIAL PRIMARY KEY,
+                    job_name     TEXT NOT NULL,
+                    concrete_grade TEXT NOT NULL,
+                    ordered_qty  REAL NOT NULL,
+                    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                CREATE INDEX IF NOT EXISTS idx_job_orders_name ON job_orders(job_name);
+            """)
+            conn.commit()
         log.warning("DB ready.")
+        # ── One-time cleanup: remove specific users ──
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM users WHERE username = %s", ("nuna_yemir",))
+            conn.commit()
     finally:
         get_pool().putconn(conn)
 
@@ -207,7 +248,9 @@ def add_job(name):
     label = f"{name} - {_d.today().strftime('%b %d')}"
     db("INSERT INTO jobs (name, status, created_at) VALUES (%s, 'active', NOW())", (label,))
     cdel("jobs_active","jobs_None")
-    return label
+    # fetch the id we just inserted
+    row = db("SELECT id FROM jobs WHERE name=%s ORDER BY created_at DESC", (label,), one=True)
+    return label, (row["id"] if row else None)
 
 def job_exists(name):
     rows = db("SELECT name FROM jobs WHERE status='active' AND name LIKE %s",
@@ -277,6 +320,18 @@ def set_user_role(uid, role):
     db("UPDATE users SET role=%s WHERE user_id=%s", (role, uid))
     cdel(f"role_{uid}")
 
+def save_job_order(job_name, grade, qty):
+    db("INSERT INTO job_orders (job_name,concrete_grade,ordered_qty,created_at) VALUES (%s,%s,%s,NOW())",
+       (job_name, grade, qty))
+    cdel_prefix(f"orders_{job_name}")
+
+def get_job_orders(job_name):
+    k = f"orders_{job_name}"
+    if cget(k) is not None: return cget(k)
+    rows = db("SELECT concrete_grade, ordered_qty FROM job_orders WHERE job_name=%s ORDER BY concrete_grade",
+              (job_name,), many=True) or []
+    cset(k, rows); return rows
+
 
 # ─────────────────────────────────────────────
 # REPORTS
@@ -308,24 +363,65 @@ def _build_report_text(trips, label):
         if j2 not in job_grades: job_grades[j2]={}
         if g2 not in job_grades[j2]: job_grades[j2][g2]=[0.0,0]
         job_grades[j2][g2][0]+=v2; job_grades[j2][g2][1]+=1
+
     job_lines=[]
     for i,(n,d) in enumerate(sorted(jobs.items(),key=lambda x:-x[1][0])[:5]):
         line=f"  {i+1}. *{n}*: *{d[0]:.1f} m³* ({d[1]} trips)"
         gbd=job_grades.get(n,{})
+        # fetch orders for this job and merge into grade display
+        orders = {r["concrete_grade"]: float(r["ordered_qty"]) for r in get_job_orders(n)}
         if gbd:
-            gp=" | ".join(f"{g}: {gd[0]:.1f} m³" for g,gd in sorted(gbd.items(),key=lambda x:-x[1][0]))
-            line+=f"\n      🧱 {gp}"
+            grade_parts=[]
+            for g,gd in sorted(gbd.items(),key=lambda x:-x[1][0]):
+                part = f"{g}: {gd[0]:.1f}"
+                if g in orders:
+                    pct = (gd[0]/orders[g]*100) if orders[g] else 0
+                    part += f"/{orders[g]:.1f} m³ ({pct:.0f}%)"
+                else:
+                    part += " m³"
+                grade_parts.append(part)
+            line+=f"\n      🧱 "+" | ".join(grade_parts)
+        elif orders:
+            order_parts = [f"{g}: 0/{v:.1f} m³ (0%)" for g,v in orders.items()]
+            line+=f"\n      🧱 "+" | ".join(order_parts)
         job_lines.append(line)
     jl="\n".join(job_lines)
     gl="\n".join(f"  🧱 {g}: *{d[0]:.1f} m³* ({d[1]} trips)"
                  for g,d in sorted(grades.items(),key=lambda x:-x[1][0]))
     tl="\n".join(f"  {medals[i] if i<3 else '▪️'} {pl}: *{d[0]:.1f} m³* ({d[1]} trips)"
                  for i,(pl,d) in enumerate(sorted(trucks.items(),key=lambda x:-x[1][0])))
+
+    # ── Per-trip detail table: Date | Client | Grade | Ordered | Qty ──
+    # Pre-build a lookup: job_name -> {grade -> ordered_qty}
+    all_job_names = list({t["job_name"] for t in trips})
+    order_lookup = {jn: {r["concrete_grade"]: float(r["ordered_qty"])
+                         for r in get_job_orders(jn)}
+                    for jn in all_job_names}
+
+    trip_rows = []
+    for t in trips[:50]:
+        ts     = str(t.get("logged_at",""))
+        day    = (ts[8:10]+"/"+ts[5:7]) if len(ts)>=10 else "—"
+        client = t["job_name"][:15]
+        grade  = (t.get("concrete_grade") or "N/A")[:5]
+        qty    = float(t["volume"])
+        ordered = order_lookup.get(t["job_name"],{}).get(t.get("concrete_grade",""), None)
+        ord_str = f"{ordered:.0f}" if ordered else "—"
+        trip_rows.append(f"{day:<6} {client:<16} {grade:<5} {ord_str:>6} {qty:>6.1f}")
+    hdr = f"{'Date':<6} {'Client':<16} {'Grd':<5} {'Ord':>6} {'Qty':>6}"
+    sep = "─" * len(hdr)
+    more = f"\n_+ {len(trips)-50} more trips not shown_" if len(trips) > 50 else ""
+
     return (f"📋 *{label}*\n━━━━━━━━━━━━━━━━━━━━\n\n"
             f"📅 *Jobs*\n{jl}\n  ───────\n  *{tv:.1f} m³ | {tt} trips*\n\n"
             f"🧱 *Concrete Grades*\n{gl}\n\n"
             f"🚛 *Trucks*\n{tl}\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n_Generated {datetime.now().strftime('%H:%M %d %b %Y')}_")
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📄 *Trip Detail*  _(Ord=ordered m³, Qty=delivered m³)_\n"
+            f"```\n{hdr}\n{sep}\n" + "\n".join(trip_rows) + f"\n```"
+            + more + "\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"_Generated {datetime.now().strftime('%H:%M %d %b %Y')}_")
 
 def text_report(period):
     return _build_report_text(fetch_trips(period), plabel(period))
@@ -352,7 +448,14 @@ def _build_excel(trips, label):
         j=t["job_name"]
         if j not in jt: jt[j]=[0.0,0]
         jt[j][0]+=float(t["volume"]); jt[j][1]+=1
-    _sh("Jobs",["Job","m³","Trips"],[[n,round(v,2),tr] for n,(v,tr) in sorted(jt.items(),key=lambda x:-x[1][0])])
+    # pull order totals per job for the Jobs sheet
+    job_order_totals = {}
+    for jname in jt:
+        ords = get_job_orders(jname)
+        job_order_totals[jname] = sum(float(r["ordered_qty"]) for r in ords)
+    _sh("Jobs",["Job","Ordered m³","Delivered m³","Trips"],
+        [[n, round(job_order_totals.get(n,0),2), round(v,2), tr]
+         for n,(v,tr) in sorted(jt.items(),key=lambda x:-x[1][0])])
     gt:dict={}
     for t in trips:
         g=t.get("concrete_grade") or "N/A"
@@ -493,12 +596,24 @@ async def cb_job_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines=[]
     for j in jobs:
         s=job_summary(j["name"]); bd=grade_breakdown(j["name"])
+        orders = {r["concrete_grade"]: float(r["ordered_qty"]) for r in get_job_orders(j["name"])}
         block=(f"🟢 *{j['name']}*\n"
                f"   📦 *{float(s['vol']):.1f} m³* | *{s['trips']} trips*")
         if bd:
-            block+="\n   🧱 *Grades:*\n"+"\n".join(
-                f"      ▪️ {r['concrete_grade']}: *{float(r['vol']):.1f} m³* ({r['trips']} trips)"
-                for r in bd)
+            grade_lines=[]
+            for r in bd:
+                g=r['concrete_grade']; delivered=float(r['vol'])
+                if g in orders:
+                    pct=(delivered/orders[g]*100) if orders[g] else 0
+                    grade_lines.append(
+                        f"      ▪️ {g}: *{delivered:.1f}/{orders[g]:.1f} m³* ({pct:.0f}%) | {r['trips']} trips")
+                else:
+                    grade_lines.append(
+                        f"      ▪️ {g}: *{delivered:.1f} m³* ({r['trips']} trips)")
+            block+="\n   🧱 *Grades:*\n"+"\n".join(grade_lines)
+        elif orders:
+            block+="\n   🧱 *Ordered (no deliveries yet):*\n"
+            block+="\n".join(f"      ▪️ {g}: *0/{v:.1f} m³*" for g,v in orders.items())
         lines.append(block)
     await q.edit_message_text(
         "🏗️ *Active Job Sites*\n━━━━━━━━━━━━━━━━━━━━\n\n"+"\n\n".join(lines),
@@ -564,6 +679,16 @@ async def conv_truck_save(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 # ─────────────────────────────────────────────
 # ADD JOB
 # ─────────────────────────────────────────────
+def _kb_order_grades():
+    """Grade keyboard for order step — same layout as trip grade picker."""
+    rows=[]; row=[]
+    for i,g in enumerate(CONCRETE_GRADES,1):
+        row.append(InlineKeyboardButton(g, callback_data=f"ojg_{g}"))
+        if i%3==0: rows.append(row); row=[]
+    if row: rows.append(row)
+    rows.append([InlineKeyboardButton("⏭️ Skip / Done", callback_data="ojg_skip")])
+    return InlineKeyboardMarkup(rows)
+
 async def conv_job_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     q=update.callback_query; await q.answer()
     if not is_admin(q.from_user.id):
@@ -572,25 +697,30 @@ async def conv_job_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await q.message.reply_text("🆕 Enter job site name:")
     return ASK_NEW_JOB_NAME
 
-async def conv_job_save(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def conv_job_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Received the job name — check duplicates then go to order step."""
     name=update.message.text.strip()
-    context.user_data["pending_job"]=name
-    existing=job_exists(name)
+    context.user_data["pending_job"] = name
+    existing = job_exists(name)
     if existing:
         el="\n".join(f"  - {e}" for e in existing)
         await update.message.reply_text(
             f"⚠️ Warning! Active jobs exist for this company:\n\n{el}\n\nAdd new job anyway?",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Yes, add new job",callback_data="job_dup_yes")],
-                [InlineKeyboardButton("❌ No, cancel",callback_data="job_dup_no")]]))
+                [InlineKeyboardButton("✅ Yes, add new job", callback_data="job_dup_yes")],
+                [InlineKeyboardButton("❌ No, cancel",       callback_data="job_dup_no")]]))
         return ASK_JOB_DUPLICATE
-    label=add_job(name)
+    # No duplicate — create the job and ask for order
+    label, jid = add_job(name)
+    context.user_data["job_label"] = label
+    context.user_data["job_orders"] = []   # list of (grade, qty) collected so far
     await update.message.reply_text(
-        f"✅ Job added!\n\n🏗️ {label}\n🟢 ACTIVE",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🆕 Add Another",callback_data="add_job")],
-            [InlineKeyboardButton("🏠 Main Menu",callback_data="back_main")]]))
-    return ConversationHandler.END
+        f"✅ *Job created:* `{label}`\n\n"
+        f"📦 *Step 2 — Set ordered quantity (optional)*\n"
+        f"Select a concrete grade to enter its ordered amount, or skip:",
+        parse_mode="Markdown",
+        reply_markup=_kb_order_grades())
+    return ASK_ORDER_GRADE
 
 async def conv_job_dup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     q=update.callback_query; await q.answer()
@@ -598,13 +728,76 @@ async def conv_job_dup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         await q.edit_message_text("❌ Cancelled.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu",callback_data="back_main")]]))
         return ConversationHandler.END
-    name=context.user_data.get("pending_job","")
-    label=add_job(name)
+    name = context.user_data.get("pending_job","")
+    label, jid = add_job(name)
+    context.user_data["job_label"]  = label
+    context.user_data["job_orders"] = []
     await q.edit_message_text(
-        f"✅ Job added!\n\n🏗️ {label}\n🟢 ACTIVE",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🆕 Add Another",callback_data="add_job")],
-            [InlineKeyboardButton("🏠 Main Menu",callback_data="back_main")]]))
+        f"✅ *Job created:* `{label}`\n\n"
+        f"📦 *Set ordered quantity (optional)*\n"
+        f"Select a concrete grade to enter its ordered amount, or skip:",
+        parse_mode="Markdown",
+        reply_markup=_kb_order_grades())
+    return ASK_ORDER_GRADE
+
+async def conv_job_order_grade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Admin picked a grade (or Skip) in the order step."""
+    q=update.callback_query; await q.answer()
+    grade = q.data.replace("ojg_","")
+    if grade == "skip":
+        return await _finish_job(q.message, context, edit=False)
+    context.user_data["order_grade"] = grade
+    # Show what's been entered so far
+    orders = context.user_data.get("job_orders",[])
+    so_far = ""
+    if orders:
+        so_far = "\n_So far:_ " + ", ".join(f"{g}: {v} m³" for g,v in orders)
+    await q.message.reply_text(
+        f"📦 Enter ordered quantity for *{grade}* (m³):{so_far}",
+        parse_mode="Markdown")
+    return ASK_ORDER_QTY
+
+async def conv_job_order_qty(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Admin typed the qty for the selected grade."""
+    try:
+        qty = float(update.message.text.strip())
+        if qty <= 0: raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Enter a valid positive number (e.g. 150.5)")
+        return ASK_ORDER_QTY
+    grade = context.user_data.get("order_grade","")
+    label = context.user_data.get("job_label","")
+    # Save order entry
+    save_job_order(label, grade, qty)
+    orders = context.user_data.get("job_orders",[])
+    orders.append((grade, qty))
+    context.user_data["job_orders"] = orders
+    so_far = ", ".join(f"{g}: {v} m³" for g,v in orders)
+    await update.message.reply_text(
+        f"✅ *{grade}*: *{qty} m³* recorded.\n_Total orders so far: {so_far}_\n\n"
+        f"Add another grade or finish:",
+        parse_mode="Markdown",
+        reply_markup=_kb_order_grades())
+    return ASK_ORDER_GRADE
+
+async def _finish_job(message, context, edit=False):
+    """Show final job creation confirmation and end conversation."""
+    label  = context.user_data.get("job_label","")
+    orders = context.user_data.get("job_orders",[])
+    order_txt = ""
+    if orders:
+        order_txt = "\n📦 *Orders:*\n" + "\n".join(f"  🧱 {g}: *{v} m³*" for g,v in orders)
+    else:
+        order_txt = "\n_No order quantities set._"
+    context.user_data.clear()
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🆕 Add Another Job", callback_data="add_job")],
+        [InlineKeyboardButton("🏠 Main Menu",       callback_data="back_main")]])
+    txt = f"🏗️ *Job Ready!*\n\n`{label}`\n🟢 ACTIVE{order_txt}"
+    if edit:
+        await message.edit_text(txt, parse_mode="Markdown", reply_markup=kb)
+    else:
+        await message.reply_text(txt, parse_mode="Markdown", reply_markup=kb)
     return ConversationHandler.END
 
 
@@ -773,10 +966,10 @@ async def cb_excel_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query; period=q.data.replace("exp_","")
     await q.answer("Generating…")
     buf=excel_report(period)
-    await context.bot.send_document(
-        chat_id=q.message.chat_id,
-        document=InputFile(buf,filename=f"trips_{period}_{date.today()}.xlsx"),
-        caption=f"📥 *{plabel(period)}*",parse_mode="Markdown")
+    await _send_doc_with_retry(
+        context.bot, q.message.chat_id, buf,
+        filename=f"trips_{period}_{date.today()}.xlsx",
+        caption=f"📥 *{plabel(period)}*")
 
 
 # ─────────────────────────────────────────────
@@ -849,10 +1042,10 @@ async def conv_custom_to(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return ConversationHandler.END
         buf = _build_excel(trips, label)
         safe = label.replace(" ","_").replace("–","-")
-        await update.message.reply_document(
-            document=InputFile(buf, filename=f"trips_{safe}.xlsx"),
-            caption=f"📥 *{label}*  ({len(trips)} trips)",
-            parse_mode="Markdown")
+        await _send_doc_with_retry(
+            update.message.get_bot(), update.message.chat_id, buf,
+            filename=f"trips_{safe}.xlsx",
+            caption=f"📥 *{label}*  ({len(trips)} trips)")
     else:
         await update.message.reply_text(
             _build_report_text(trips, label),
@@ -969,73 +1162,49 @@ async def cb_manage_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not users:
         await q.edit_message_text("👥 *Users*\n\n_No users registered._",
             parse_mode="Markdown",reply_markup=kb_back()); return
-   kb = []
-   for u in users:
-    role_icon = "👑" if u["role"] == "admin" else "👷"
-    uname = (u["username"] or f"id:{u['user_id']}").replace("_", "\\_")
-    kb.append([
-        InlineKeyboardButton(
+    kb=[]
+    for u in users:
+        role_icon="👑" if u["role"]=="admin" else "👷"
+        uname=u["username"] or f"id:{u['user_id']}"
+        kb.append([InlineKeyboardButton(
             f"{role_icon} {uname} — {u['role']}",
-            callback_data=f"userinfo_{u['user_id']}"
-        )
-    ])
+            callback_data=f"userinfo_{u['user_id']}")])
+    kb.append([InlineKeyboardButton("⬅️ Back",callback_data="back_main")])
     await q.edit_message_text(
         "👥 *User Management*\n━━━━━━━━━━━━━━━━━━━━\n\nSelect a user to manage:",
-        parse_mode="MarkdownV2",reply_markup=InlineKeyboardMarkup(kb))
+        parse_mode="Markdown",reply_markup=InlineKeyboardMarkup(kb))
 
 async def cb_user_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-
-    if not is_admin(q.from_user.id):
-        return
-
-    uid = int(q.data.replace("userinfo_", ""))
+    q=update.callback_query; await q.answer()
+    if not is_admin(q.from_user.id): return
+    # Extract user_id safely — the ID can be very large so we split carefully
+    target_uid = int(q.data[len("userinfo_"):])
     users = get_all_users()
-    u = next((x for x in users if x["user_id"] == uid), None)
-
+    u = next((x for x in users if x["user_id"] == target_uid), None)
     if not u:
-        await q.edit_message_text(
-            "User not found.",
-            reply_markup=kb_back()
-        )
-        return
-
-    role_icon = "👑" if u["role"] == "admin" else "👷"
-    new_role = "worker" if u["role"] == "admin" else "admin"
-    new_icon = "👷" if new_role == "worker" else "👑"
-
-    uname = (u["username"] or f"id:{u['user_id']}").replace("_", "\\_")
-
+        await q.edit_message_text("⚠️ User not found.",reply_markup=kb_back()); return
+    role_icon = "👑" if u["role"]=="admin" else "👷"
+    uname = u["username"] or f"id:{u['user_id']}"
+    new_role = "worker" if u["role"]=="admin" else "admin"
+    new_icon = "👷" if new_role=="worker" else "👑"
+    # Encode as uid|role to avoid ambiguity in patterns
     await q.edit_message_text(
-        f"👤 *User Details*\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"👤 *User Details*\n━━━━━━━━━━━━━━━━━━━━\n\n"
         f"Name: {uname}\n"
         f"Role: {role_icon} *{u['role']}*\n"
         f"ID: `{u['user_id']}`\n"
         f"Joined: {str(u['joined_at'])[:10]}",
-        parse_mode="MarkdownV2",
+        parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    f"Change to {new_icon} {new_role}",
-                    callback_data=f"setrole_{uid}_{new_role}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "🗑️ Remove User",
-                    callback_data=f"removeuser_{uid}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "⬅️ Back",
-                    callback_data="manage_users"
-                )
-            ]
-        ])
-    )
+            [InlineKeyboardButton(
+                f"Change to {new_icon} {new_role}",
+                callback_data=f"setrole_{target_uid}_{new_role}")],
+            [InlineKeyboardButton(
+                "🗑️ Remove User",
+                callback_data=f"removeuser_{target_uid}")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="manage_users")],
+        ]))
+
 async def cb_set_role(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query; await q.answer()
     if not is_admin(q.from_user.id): return
@@ -1110,17 +1279,27 @@ def main():
         threading.Thread(target=_start_health,daemon=True).start()
         kill_webhook()
 
+    # Raise timeouts so large Excel uploads don't fail on Render's slow egress
+    _request = HTTPXRequest(
+        connection_pool_size=8,
+        read_timeout=60,
+        write_timeout=60,
+        connect_timeout=15,
+        pool_timeout=30,
+    )
     app=(Application.builder()
          .token(BOT_TOKEN)
+         .request(_request)
          .concurrent_updates(False)
-         .connection_pool_size(8)
          .build())
 
     add_job_conv=ConversationHandler(
         entry_points=[CallbackQueryHandler(conv_job_start,pattern="^add_job$")],
         states={
-            ASK_NEW_JOB_NAME: [MessageHandler(filters.TEXT&~filters.COMMAND,conv_job_save)],
-            ASK_JOB_DUPLICATE:[CallbackQueryHandler(conv_job_dup,pattern="^job_dup_(yes|no)$")],
+            ASK_NEW_JOB_NAME: [MessageHandler(filters.TEXT&~filters.COMMAND, conv_job_name)],
+            ASK_JOB_DUPLICATE:[CallbackQueryHandler(conv_job_dup, pattern="^job_dup_(yes|no)$")],
+            ASK_ORDER_GRADE:  [CallbackQueryHandler(conv_job_order_grade, pattern="^ojg_")],
+            ASK_ORDER_QTY:    [MessageHandler(filters.TEXT&~filters.COMMAND, conv_job_order_qty)],
         },
         fallbacks=[CommandHandler("cancel",conv_cancel)],
         allow_reentry=True,
