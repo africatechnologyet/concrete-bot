@@ -31,9 +31,11 @@ WORKER_SECRET = "Worker"
 PORT          = int(os.environ.get("PORT", 10000))
 
 CONCRETE_GRADES = [
-    "C5","C8","C10","C12","C15","C16","C20",
-    "C25","C30","C35","C40","C45","C50"
+    "C5","C10","C15","C20","C25","C30",
+    "C35","C37","C40","C45","C50","C60"
 ]
+
+COMPANY_NAME = "CoBuilt Solutions"
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.WARNING)
 log = logging.getLogger(__name__)
@@ -338,11 +340,11 @@ def get_job_orders(job_name):
 # ─────────────────────────────────────────────
 def plabel(p):
     t = date.today()
-    if p=="daily":  return f"Daily — {t.strftime('%b %d, %Y')}"
+    if p=="daily":  return f"{COMPANY_NAME} — Daily — {t.strftime('%b %d, %Y')}"
     if p=="weekly":
         m = t-timedelta(days=t.weekday())
-        return f"Week {m.strftime('%b %d')}–{(m+timedelta(6)).strftime('%b %d, %Y')}"
-    return f"Month of {t.strftime('%B %Y')}"
+        return f"{COMPANY_NAME} — Week {m.strftime('%b %d')}–{(m+timedelta(6)).strftime('%b %d, %Y')}"
+    return f"{COMPANY_NAME} — {t.strftime('%B %Y')}"
 
 def _build_report_text(trips, label):
     """Shared report builder used by both period and custom range reports."""
@@ -548,14 +550,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if args[0]==ADMIN_SECRET:
             register_user(u.id,u.username or "","admin")
             await update.message.reply_text(
-                f"👑 *Welcome Admin {u.first_name}!*\n\n"
+                f"👑 *Welcome Admin {u.first_name}!*\n_{COMPANY_NAME}_\n\n"
                 f"Admin:  `https://t.me/{BOT_USERNAME}?start=Admin`\n"
                 f"Worker: `https://t.me/{BOT_USERNAME}?start=Worker`",
                 parse_mode="Markdown",reply_markup=kb_main(u.id))
         elif args[0]==WORKER_SECRET:
             register_user(u.id,u.username or "","worker")
             await update.message.reply_text(
-                f"👷 *Welcome {u.first_name}!*\n\nWorker access granted.",
+                f"👷 *Welcome {u.first_name}!*\n_{COMPANY_NAME}_\n\nWorker access granted.",
                 parse_mode="Markdown",reply_markup=kb_main(u.id))
         else:
             await update.message.reply_text("❌ Invalid link.")
@@ -564,7 +566,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if role:
         lbl="👑 Admin" if role=="admin" else "👷 Worker"
         await update.message.reply_text(
-            f"🏗️ *Concrete Logistics*\n_{lbl}_\n\nWelcome back, {u.first_name}!",
+            f"🏗️ *Concrete Logistics*\n_{COMPANY_NAME} — {lbl}_\n\nWelcome back, {u.first_name}!",
             parse_mode="Markdown",reply_markup=kb_main(u.id))
     else:
         await update.message.reply_text("🚫 Use your access link to register.")
@@ -575,7 +577,7 @@ async def cb_back_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not role: await q.edit_message_text("🚫 Access denied."); return
     lbl="👑 Admin" if role=="admin" else "👷 Worker"
     await q.edit_message_text(
-        f"🏗️ *Concrete Logistics*\n_{lbl}_\n\nWhat would you like to do?",
+        f"🏗️ *Concrete Logistics*\n_{COMPANY_NAME} — {lbl}_\n\nWhat would you like to do?",
         parse_mode="Markdown",reply_markup=kb_main(uid))
 
 async def cb_noop(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1029,7 +1031,7 @@ async def conv_custom_to(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return ASK_DATE_TO
 
     mode = context.user_data.get("custom_mode","rep")
-    label = f"{d_from.strftime('%d %b')} – {d_to.strftime('%d %b %Y')}"
+    label = f"{COMPANY_NAME} — {d_from.strftime('%d %b')} – {d_to.strftime('%d %b %Y')}"
     trips = fetch_trips_range(d_from, d_to)
     context.user_data.clear()
 
