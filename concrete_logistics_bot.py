@@ -249,14 +249,11 @@ async def generate_report():
     total_trips = row["total_trips"] or 0
     total_quantity = row["total_quantity"] or 0
 
-    report = (
-        f"<b>Daily Production Report</b>
-
-"
-        f"Total Trips: {total_trips}
-"
-        f"Total Concrete: {total_quantity} m³"
-    )
+  report = (
+    f"<b>Daily Production Report</b>\n\n"
+    f"Total Trips: {total_trips}\n"
+    f"Total Concrete: {total_quantity} m³"
+  )
 
     return report
 
