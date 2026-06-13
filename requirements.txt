@@ -4,3 +4,4 @@ requests==2.31.0
 urllib3<2.0.0
 psycopg2-binary
 openpyxl
+aiogram==2.25.1
