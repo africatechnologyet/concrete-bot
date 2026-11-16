@@ -839,7 +839,16 @@ async def conv_trip_volume(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.message.reply_text("❌ Enter a valid positive number (e.g. 7.5)")
         return ASK_VOLUME
     job=context.user_data["job"]; grade=context.user_data["grade"]; plate=context.user_data["plate"]
-    save_trip(update.effective_user.id,job,grade,plate,vol)
+    try:
+        trip_id = save_trip(update.effective_user.id,job,grade,plate,vol)
+    except Exception as exc:
+        log.exception("Trip save / cement deduction failed")
+        await update.message.reply_text(
+            f"❌ Trip was not saved. No cement was deducted.\\n\\n{exc}\\n\\n"
+            "Please resolve the issue and submit the volume again.",
+            reply_markup=kb_back()
+        )
+        return ASK_VOLUME
     context.user_data.clear()
     await update.message.reply_text(
         f"✅ *Trip Saved!*\n"
