@@ -74,9 +74,13 @@ def get_pool():
         dsn = DATABASE_URL
         if DB_SCHEMA != "public":
             # Create the dedicated Concrete schema before setting search_path.
-            with psycopg2.connect(DATABASE_URL) as bootstrap:
+            bootstrap = psycopg2.connect(DATABASE_URL)
+            try:
                 with bootstrap.cursor() as cur:
                     cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{DB_SCHEMA}"')
+                bootstrap.commit()
+            finally:
+                bootstrap.close()
             dsn = psycopg2.extensions.make_dsn(
                 DATABASE_URL, options=f"-c search_path={DB_SCHEMA},public"
             )
@@ -148,6 +152,16 @@ def init_db():
                 END $$;
             """)
             conn.commit()
+            # Integrated development installs use a dedicated schema and
+            # a Telegram message key to make retried updates idempotent.
+            if CEMENT_INTEGRATION_ENABLED:
+                cur.execute("""
+                    ALTER TABLE trips ADD COLUMN IF NOT EXISTS source_message_id BIGINT;
+                    CREATE UNIQUE INDEX IF NOT EXISTS uq_trips_user_source_message
+                    ON trips(user_id, source_message_id)
+                    WHERE source_message_id IS NOT NULL;
+                """)
+                conn.commit()
             # Indexes after columns exist
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_trips_logged ON trips(logged_at);
@@ -223,7 +237,7 @@ def set_job_status(jid, status):
     db("UPDATE jobs SET status=%s,updated_at=NOW() WHERE id=%s", (status, jid))
     cdel("jobs_active","jobs_None")
 
-def save_trip(uid, job, grade, plate, vol):
+def save_trip(uid, job, grade, plate, vol, source_message_id=None):
     if not CEMENT_INTEGRATION_ENABLED:
         db("INSERT INTO trips (user_id,job_name,concrete_grade,truck_plate,volume,logged_at) VALUES (%s,%s,%s,%s,%s,NOW())",
            (uid, job, grade, plate, vol))
@@ -238,6 +252,15 @@ def save_trip(uid, job, grade, plate, vol):
     conn = get_pool().getconn()
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            if source_message_id is not None:
+                cur.execute(
+                    "SELECT id FROM trips WHERE user_id=%s AND source_message_id=%s",
+                    (uid, source_message_id)
+                )
+                prior_trip = cur.fetchone()
+                if prior_trip:
+                    conn.rollback()
+                    return prior_trip["id"]
             cur.execute(
                 f"SELECT id, kg_per_m3 FROM {CEMENT_SCHEMA}.cement_grade_factors "
                 "WHERE concrete_grade=%s AND is_active=TRUE "
@@ -271,9 +294,9 @@ def save_trip(uid, job, grade, plate, vol):
             new_stock = current_stock - quantity
             cur.execute(
                 f"INSERT INTO trips "
-                "(user_id,job_name,concrete_grade,truck_plate,volume,logged_at) "
-                "VALUES (%s,%s,%s,%s,%s,NOW()) RETURNING id",
-                (uid, job, grade, plate, vol)
+                "(user_id,job_name,concrete_grade,truck_plate,volume,logged_at,source_message_id) "
+                "VALUES (%s,%s,%s,%s,%s,NOW(),%s) RETURNING id",
+                (uid, job, grade, plate, vol, source_message_id)
             )
             trip_id = cur.fetchone()["id"]
             cur.execute(
@@ -840,7 +863,7 @@ async def conv_trip_volume(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return ASK_VOLUME
     job=context.user_data["job"]; grade=context.user_data["grade"]; plate=context.user_data["plate"]
     try:
-        trip_id = save_trip(update.effective_user.id,job,grade,plate,vol)
+        trip_id = save_trip(update.effective_user.id,job,grade,plate,vol,update.message.message_id)
     except Exception as exc:
         log.exception("Trip save / cement deduction failed")
         await update.message.reply_text(
