@@ -340,6 +340,8 @@ def fetch_trips(period):
     cset(k, rows); return rows
 
 def delete_trips(period):
+    if CEMENT_INTEGRATION_ENABLED:
+        raise RuntimeError("Trip deletion is disabled in integrated mode. Trips and their cement deductions must remain linked for stock reconciliation.")
     if period == "all": n = db("DELETE FROM trips", rc=True)
     else:
         wh, p = _range(period)
@@ -476,8 +478,9 @@ def kb_main(uid):
          [InlineKeyboardButton("📊 View Reports",callback_data="menu_reports")],
          [InlineKeyboardButton("📥 Export Excel",callback_data="menu_export")]]
     if admin:
-        kb+=[[InlineKeyboardButton("🗑️ Delete Reports",callback_data="delete_reports_menu")],
-             [InlineKeyboardButton("✅ Complete Job",callback_data="complete_job")],
+        if not CEMENT_INTEGRATION_ENABLED:
+            kb+=[[InlineKeyboardButton("🗑️ Delete Reports",callback_data="delete_reports_menu")]]
+        kb+=[[InlineKeyboardButton("✅ Complete Job",callback_data="complete_job")],
              [InlineKeyboardButton("❌ Cancel Job",callback_data="cancel_job")],
              [InlineKeyboardButton("👥 Manage Users",callback_data="manage_users")]]
     return InlineKeyboardMarkup(kb)
@@ -723,6 +726,9 @@ async def cb_del_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cb_del_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query; period=q.data.replace("delask_",""); await q.answer()
+    if CEMENT_INTEGRATION_ENABLED:
+        await q.edit_message_text("🚫 Trip deletion is disabled while automatic cement deductions are active. This protects stock and trip history.", reply_markup=kb_back())
+        return
     await q.edit_message_text(
         f"⚠️ Delete *{_PL[period]}*?\n\nThis cannot be undone.",
         parse_mode="Markdown",
@@ -732,6 +738,9 @@ async def cb_del_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cb_del_do(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query; period=q.data.replace("deldo_",""); await q.answer()
+    if CEMENT_INTEGRATION_ENABLED:
+        await q.edit_message_text("🚫 Trip deletion is disabled while automatic cement deductions are active. This protects stock and trip history.", reply_markup=kb_back())
+        return
     n=delete_trips(period)
     await q.edit_message_text(f"🗑️ Deleted *{n}* records.",parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
@@ -988,7 +997,7 @@ def kill_webhook():
     for attempt in range(5):
         try:
             r=requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook",
-                            json={"drop_pending_updates":True},timeout=10)
+                            json={"drop_pending_updates":False},timeout=10)
             log.warning(f"deleteWebhook attempt {attempt+1} → {r.json()}")
             if r.json().get("ok"): break
         except Exception as e:
@@ -1007,8 +1016,9 @@ def main():
         # Delete any existing webhook/polling before setting new one
         kill_webhook()
     else:
-        # local dev only
-        threading.Thread(target=_start_health,daemon=True).start()
+        # Local development only. A supervised Render worker does not need an HTTP port.
+        if os.environ.get("COBUILT_SUPERVISED_WORKER", "false").lower() != "true":
+            threading.Thread(target=_start_health,daemon=True).start()
         kill_webhook()
 
     app=(Application.builder()
