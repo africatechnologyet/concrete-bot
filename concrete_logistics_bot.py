@@ -82,7 +82,7 @@ def get_pool():
             finally:
                 bootstrap.close()
             dsn = psycopg2.extensions.make_dsn(
-                DATABASE_URL, options=f"-c search_path={DB_SCHEMA},public"
+                DATABASE_URL, options=f"-c search_path={DB_SCHEMA}"
             )
         _pool = psycopg2.pool.ThreadedConnectionPool(1, 10, dsn)
     return _pool
