@@ -5,12 +5,12 @@ Admin:  https://t.me/MaterialConcretebot?start=Admin
 Worker: https://t.me/MaterialConcretebot?start=Worker
 """
 
-import os, logging, io, threading, time, requests
+import os, logging, io, threading, time, requests, re
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timedelta, date
 from typing import Optional
 
-import psycopg2, psycopg2.extras, psycopg2.pool
+import psycopg2, psycopg2.extras, psycopg2.pool, psycopg2.extensions
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
@@ -28,6 +28,12 @@ BOT_USERNAME  = "MaterialConcretebot"
 ADMIN_SECRET  = "Admin"
 WORKER_SECRET = "Worker"
 PORT          = int(os.environ.get("PORT", 10000))
+DB_SCHEMA     = os.environ.get("DB_SCHEMA", "public")
+CEMENT_SCHEMA = os.environ.get("CEMENT_SCHEMA", "public")
+CEMENT_INTEGRATION_ENABLED = os.environ.get("COBUILT_CEMENT_INTEGRATION_ENABLED", "false").lower() == "true"
+for _schema in (DB_SCHEMA, CEMENT_SCHEMA):
+    if not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", _schema):
+        raise ValueError("Database schema names must be simple PostgreSQL identifiers.")
 
 CONCRETE_GRADES = [
     "C5","C8","C10","C12","C15","C16","C20",
@@ -65,7 +71,16 @@ _pool: Optional[psycopg2.pool.ThreadedConnectionPool] = None
 def get_pool():
     global _pool
     if _pool is None or _pool.closed:
-        _pool = psycopg2.pool.ThreadedConnectionPool(1, 10, DATABASE_URL)
+        dsn = DATABASE_URL
+        if DB_SCHEMA != "public":
+            # Create the dedicated Concrete schema before setting search_path.
+            with psycopg2.connect(DATABASE_URL) as bootstrap:
+                with bootstrap.cursor() as cur:
+                    cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{DB_SCHEMA}"')
+            dsn = psycopg2.extensions.make_dsn(
+                DATABASE_URL, options=f"-c search_path={DB_SCHEMA},public"
+            )
+        _pool = psycopg2.pool.ThreadedConnectionPool(1, 10, dsn)
     return _pool
 
 def db(sql, params=(), *, one=False, many=False, rc=False):
@@ -209,9 +224,82 @@ def set_job_status(jid, status):
     cdel("jobs_active","jobs_None")
 
 def save_trip(uid, job, grade, plate, vol):
-    db("INSERT INTO trips (user_id,job_name,concrete_grade,truck_plate,volume,logged_at) VALUES (%s,%s,%s,%s,%s,NOW())",
-       (uid, job, grade, plate, vol))
-    cdel_prefix("trips_","summary_","breakdown_")
+    if not CEMENT_INTEGRATION_ENABLED:
+        db("INSERT INTO trips (user_id,job_name,concrete_grade,truck_plate,volume,logged_at) VALUES (%s,%s,%s,%s,%s,NOW())",
+           (uid, job, grade, plate, vol))
+        cdel_prefix("trips_","summary_","breakdown_")
+        return None
+
+    # One PostgreSQL transaction spans the Concrete schema and Cement's public
+    # schema. Either the trip and its cement ledger/stock update all commit,
+    # or none of them do.
+    if DB_SCHEMA == "public" or CEMENT_SCHEMA == DB_SCHEMA:
+        raise RuntimeError("Integrated mode requires a dedicated Concrete schema separate from the Cement schema.")
+    conn = get_pool().getconn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                f"SELECT id, kg_per_m3 FROM {CEMENT_SCHEMA}.cement_grade_factors "
+                "WHERE concrete_grade=%s AND is_active=TRUE "
+                "ORDER BY created_at DESC, id DESC LIMIT 1 FOR SHARE",
+                (grade.upper(),)
+            )
+            factor = cur.fetchone()
+            if not factor:
+                raise ValueError(f"No active cement factor is configured for {grade}. Ask a Cement Stock administrator.")
+            cur.execute(
+                f"SELECT id FROM {CEMENT_SCHEMA}.users WHERE telegram_id=%s AND is_active=TRUE",
+                (uid,)
+            )
+            operator = cur.fetchone()
+            if not operator:
+                raise ValueError("This Concrete Bot user must first be registered as an active Cement Stock user.")
+            quantity = float(vol) * float(factor["kg_per_m3"])
+            cur.execute(
+                f"SELECT value FROM {CEMENT_SCHEMA}.stock_settings "
+                "WHERE key='current_stock' FOR UPDATE"
+            )
+            stock_row = cur.fetchone()
+            if not stock_row:
+                raise ValueError("Cement stock has not been initialized.")
+            current_stock = float(stock_row["value"])
+            if quantity > current_stock:
+                raise ValueError(
+                    f"Insufficient cement stock. Available: {current_stock:,.2f} kg; "
+                    f"required: {quantity:,.2f} kg."
+                )
+            new_stock = current_stock - quantity
+            cur.execute(
+                f"INSERT INTO trips "
+                "(user_id,job_name,concrete_grade,truck_plate,volume,logged_at) "
+                "VALUES (%s,%s,%s,%s,%s,NOW()) RETURNING id",
+                (uid, job, grade, plate, vol)
+            )
+            trip_id = cur.fetchone()["id"]
+            cur.execute(
+                f"UPDATE {CEMENT_SCHEMA}.stock_settings "
+                "SET value=%s, updated_at=NOW() WHERE key='current_stock'",
+                (str(new_stock),)
+            )
+            cur.execute(
+                f"INSERT INTO {CEMENT_SCHEMA}.consumption "
+                "(operator_id,quantity_kg,cubic_meters,kg_per_m3,project_name,"
+                "concrete_grade,stock_after,note,source_system,source_trip_id,"
+                "factor_version_id,timestamp) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())",
+                (operator["id"], quantity, vol, float(factor["kg_per_m3"]),
+                 job, grade.upper(), new_stock,
+                 f"Automatic deduction from Concrete Logistics trip #{trip_id}",
+                 "concrete-bot", trip_id, factor["id"])
+            )
+        conn.commit()
+        cdel_prefix("trips_","summary_","breakdown_")
+        return trip_id
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        get_pool().putconn(conn)
 
 def _range(period):
     t = date.today()
