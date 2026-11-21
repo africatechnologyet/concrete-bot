@@ -281,7 +281,7 @@ def plabel(p):
     return f"Month of {t.strftime('%B %Y')}"
 
 def _text_report_from_trips(trips, label):
-    if not trips: return f"📋 *{label}*\\n\\n_No trips recorded._"
+    if not trips: return f"📋 *{label}*\n\n_No trips recorded._"
     jobs:dict={}; trucks:dict={}; grades:dict={}
     for t in trips:
         j=t["job_name"]; p=t["truck_plate"]
@@ -304,18 +304,18 @@ def _text_report_from_trips(trips, label):
         gbd=job_grades.get(n,{})
         if gbd:
             gp=" | ".join(f"{g}: {gd[0]:.1f} m³" for g,gd in sorted(gbd.items(),key=lambda x:-x[1][0]))
-            line+=f"\\n      🧱 {gp}"
+            line+=f"\n      🧱 {gp}"
         job_lines.append(line)
-    jl="\\n".join(job_lines)
-    gl="\\n".join(f"  🧱 {g}: *{d[0]:.1f} m³* ({d[1]} trips)"
+    jl="\n".join(job_lines)
+    gl="\n".join(f"  🧱 {g}: *{d[0]:.1f} m³* ({d[1]} trips)"
                  for g,d in sorted(grades.items(),key=lambda x:-x[1][0]))
-    tl="\\n".join(f"  {medals[i] if i<3 else '▪️'} {pl}: *{d[0]:.1f} m³* ({d[1]} trips)"
+    tl="\n".join(f"  {medals[i] if i<3 else '▪️'} {pl}: *{d[0]:.1f} m³* ({d[1]} trips)"
                  for i,(pl,d) in enumerate(sorted(trucks.items(),key=lambda x:-x[1][0])))
-    return (f"📋 *{label}*\\n━━━━━━━━━━━━━━━━━━━━\\n\\n"
-            f"📅 *Jobs*\\n{jl}\\n  ───────\\n  *{tv:.1f} m³ | {tt} trips*\\n\\n"
-            f"🧱 *Concrete Grades*\\n{gl}\\n\\n"
-            f"🚛 *Trucks*\\n{tl}\\n"
-            f"━━━━━━━━━━━━━━━━━━━━\\n_Generated {datetime.now().strftime('%H:%M %d %b %Y')}_")
+    return (f"📋 *{label}*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📅 *Jobs*\n{jl}\n  ───────\n  *{tv:.1f} m³ | {tt} trips*\n\n"
+            f"🧱 *Concrete Grades*\n{gl}\n\n"
+            f"🚛 *Trucks*\n{tl}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n_Generated {datetime.now().strftime('%H:%M %d %b %Y')}_")
 
 def text_report(period):
     return _text_report_from_trips(fetch_trips(period), plabel(period))
@@ -746,9 +746,10 @@ async def conv_custom_report_end_date(update: Update, context: ContextTypes.DEFA
     return ConversationHandler.END
 
 async def cb_custom_report_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q=update.callback_query; await q.answer("Generating…")
+    q=update.callback_query
     if not get_role(q.from_user.id):
         await q.answer("Access denied.",show_alert=True); return
+    await q.answer("Generating…")
     start_value=context.user_data.get("custom_report_start")
     end_value=context.user_data.get("custom_report_end")
     if not start_value or not end_value:
